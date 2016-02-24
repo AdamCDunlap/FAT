@@ -298,33 +298,11 @@ static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
     if (d.name[0] == '\0') {
       break;
     }
-    if (filler(buf, d.name.data(), nullptr, entry_num) != 0) {
+    if (filler(buf, d.name.data(), nullptr, entry_num+1) != 0) {
       return 0;
     }
   }
   return 0;
-
-//        DIR *dp;
-//        struct dirent *de;
-//
-//        (void) offset;
-//        (void) fi;
-//
-//        dp = opendir(path);
-//        if (dp == NULL)
-//                return -errno;
-//
-//        while ((de = readdir(dp)) != NULL) {
-//                struct stat st;
-//                memset(&st, 0, sizeof(st));
-//                st.st_ino = de->d_ino;
-//                st.st_mode = de->d_type << 12;
-//                if (filler(buf, de->d_name, &st, 0))
-//                        break;
-//        }
-//
-//        closedir(dp);
-//        return 0;
 }
 
 static int adam_mknod(const char *path, mode_t mode, dev_t rdev)
@@ -360,6 +338,10 @@ static int adam_mkdir(const char *cpath, mode_t mode)
   if (!break_off_last_path_entry(path, parent_path, child_name)) {
     cerr << "mkdir called on invalid path" << endl;
     return false;
+  }
+
+  if (child_name.length() >= directory_entry::max_name_len) {
+    return -ENOENT;
   }
 
   directory_entry parent_dir_ent;
@@ -575,59 +557,18 @@ int main(int argc, char *argv[])
       " bytes" << endl;
     filestore.open(filestorename, std::ios_base::out | std::ios_base::binary);
 
-    // Seek to end and write a 0 byte
-    // Probably not necessary...
-    //filestore.seekp(filestore_size-1);
-    //filestore.write("", 1);
-
     FAT.reset();
 
     superblock sup;
     mkdir_at_directory_entry(sup.root_directory_entry, "/");
     write_cluster(superblock_cluster, &sup);
 
-    //FAT.set(0, 'a');
-    //FAT.set(1, 'b');
-    //FAT.set(2, 'c');
-    //FAT.set(8, 'd');
-
-    //FAT.set(fat_size-1, 382);
-    //FAT.set(fat_size-3, 292);
-    //FAT.set(fat_size-3, 47);
-    //FAT.set(fat_entries-3, 'e');
+    filestore.close();
+    filestore.open(filestorename,
+        std::ios_base::in | std::ios_base::out | std::ios_base::binary);
   } else {
     FAT.load();
   }
-
-  //cout << "FAT entries " << fat_entries << endl;
-  //cout << "FAT padded entries " << padded_fat_entries << endl;
-  //cout << "FAT size " << fat_size << endl;
-  //cout << "FAT padded size " << padded_fat_size << endl;
-
-  //for (int i=0; i<10; ++i) {
-  //  cout << FAT.get(i) << endl;
-  //}
-  //cout << "..." << endl;
-  //for (int i=10; i>0; --i) {
-  //  cout << FAT.get(fat_entries-i) << endl;
-  //}
-
-  //std::vector<char> writebuf(cluster_size);
-  //writebuf[42] = 'x';
-  //writebuf[43] = 'y';
-  //writebuf[44] = 'z';
-  //writebuf[45] = 'm';
-  //write_cluster(201, writebuf.data());
-
-  ////filestore.close();
-  ////filestore.open(filestorename, std::ios_base::binary);
-
-  //std::vector<char> readbuf(cluster_size);
-  //read_cluster(201, readbuf.data());
-  //cout << readbuf[42] << endl;
-  //cout << readbuf[43] << endl;
-  //cout << readbuf[44] << endl;
-  //cout << readbuf[45] << endl;
 
   adam_oper.getattr   = adam_getattr;
   adam_oper.access    = adam_access;
