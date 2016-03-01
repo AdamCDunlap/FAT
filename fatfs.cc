@@ -368,37 +368,6 @@ class directory {
     location.persist();
   }
 
-  //static int mkdir_at_directory_entry(
-  //    directory_entry& d, const string& name) {
-
-  //  d.starting_cluster = get_free_cluster();
-
-  //  strncpy(d.name.data(), name.c_str(), d.name.size()-1);
-  //  d.name[d.name.size()-1] = '\0';
-  //  d.size = directory_size;
-  //  d.flags.filetype = 1;
-
-  //  directory dir;
-  //  dir.write(dir.begin());
-
-  //  FAT.set_end(d.starting_cluster);
-
-  //  cout << "Made new directory, put it at cluster " << d.starting_cluster << endl;
-  //  return 0;
-  //}
-
-  //void add_cluster(directory_entry& dir_ent, cluster_idx_t last_cluster) {
-  //  cluster_idx_t new_cluster = get_free_cluster();
-
-  //  cout << "Putting new cluster at " << new_cluster << endl;
-  //  FAT.set(last_cluster, new_cluster);
-  //  FAT.set_end(new_cluster);
-
-  //  dir_ent.size += directory_size;
-
-  //  clear_cluster(new_cluster);
-  //}
-
   void make_child_dir(const string& name) {
     directory_entry new_dir_ent;
     populate_dirent_with_dir(name, new_dir_ent);
@@ -600,35 +569,6 @@ static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
   }
   return 0;
 
-  // meh
-  //size_t cur_fileno = 0;
-  //if (cur_fileno >= offset) {
-  //  if (filler(buf, ".", nullptr, cur_fileno+1) != 0) {
-  //    return 0;
-  //  }
-  //}
-  //++cur_fileno;
-  //if (cur_fileno >= offset) {
-  //  if (filler(buf, "..", nullptr, cur_fileno+1) != 0) {
-  //    return 0;
-  //  }
-  //}
-  //++cur_fileno;
-
-  //directory dir(dir_ent);
-  //for (const directory_entry& d : dir) {
-  //  if (cur_fileno >= offset) {
-  //    if (d.name[0] == '\0') {
-  //      break;
-  //    }
-
-  //    if (filler(buf, d.name.data(), nullptr, cur_fileno+1) != 0) {
-  //      return 0;
-  //    }
-  //  }
-  //  ++cur_fileno;
-  //}
-  //return 0;
 }
 
 static int adam_mknod(const char *path, mode_t mode, dev_t rdev)
@@ -671,65 +611,6 @@ static int adam_mkdir(const char *cpath, mode_t mode)
   }
   return 0;
 
-
-//  cluster_idx_t parent_dir_cluster = parent_dir_ent.starting_cluster;
-//  cluster_idx_t last_parent_dir_cluster;
-//  // Get parent's directory from their directory entry
-//  do {
-//      directory parent_directory(parent_dir_ent);
-//      for (directory_entry& d : parent_directory) {
-//        if (!d.is_valid()) {
-//          int err = directory::mkdir_at_directory_entry(d, child_name);
-//          if (err) {
-//            cout << "mkdir: mkdir_at_directory_entry failed, returning " << err << endl;
-//            return err;
-//          }
-//          write_cluster(parent_dir_cluster, &parent_directory);
-//          cout << "Mkdir done" << endl;
-//          return 0;
-//        }
-//      }
-//
-//    // TODO: this should be abstracted somewhat
-//
-//    cout << "Parent directory too full to make new directory, "
-//            "so we'll make it bigger! " << endl;
-//
-//    cluster_idx_t newparentcluster = get_free_cluster();
-//
-//    cout << "Putting new cluster at " << newparentcluster << endl;
-//    FAT.set(last_parent_dir_cluster, newparentcluster);
-//    FAT.set(newparentcluster, end_of_file_cluster_marker);
-//    parent_dir_cluster = newparentcluster;
-//
-//    parent_dir_ent.size += directory_size;
-//
-//    directory parent_dir_extended;
-//    write_cluster(parent_dir_cluster, &parent_dir_extended);
-//    cout << "Done making new cluster" << endl;
-//  } while(true);
-//
-//
-//
-//
-//
-//  //directory parent_dir;
-//  //read_cluster(parent_dir_ent.starting_cluster, &parent_dir);
-//
-//  //for (size_t dir_entry_num = 0;
-//  //     dir_entry_num < parent_dir.size();
-//  //     ++dir_entry_num) {
-//  //  directory_entry& d = parent_dir[dir_entry_num];
-//  //  if (d.name[0] == '\0') {
-//  //    int err = mkdir_at_directory_entry(d, child_name, parent_dir_ent);
-//  //    if (err) {
-//  //      return err;
-//  //    }
-//  //    write_cluster(parent_dir_ent.starting_cluster, &parent_dir);
-//  //    cout << "Mkdir done" << endl;
-//  //    return 0;
-//  //  }
-//  //}
 }
 
 static int adam_unlink(const char *path)
