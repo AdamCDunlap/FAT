@@ -54,26 +54,36 @@ static const size_t directory_size = cluster_size;
 static const cluster_idx_t end_of_file_cluster_marker
     = std::numeric_limits<cluster_idx_t>::max();
 
+static const string term_red = "[0;31m";
+static const string term_yellow = "[0;33m";
+static const string term_reset = "[0;0m";
+
 // Writes 1 cluster to the filestore from the pointer
 template<typename T>
 void write_cluster(size_t cluster_num, const T* data) {
-  cout << "Writing to cluster " << cluster_num << endl;
-  if (cluster_num == superblock_cluster) {
-    cout << "[32;1mWARNING: Writing to superblock cluster![0;0m" << endl;
-  }
+  //cout << "Writing to cluster " << cluster_num << endl;
+  //if (cluster_num == superblock_cluster) {
+  //  cout << "[32;1mWARNING: Writing to superblock cluster![0;0m" << endl;
+  //}
 
   filestore.seekp(cluster_num * cluster_size);
   filestore.write(reinterpret_cast<const char*>(data), cluster_size);
   filestore.flush();
 }
+void clear_cluster(size_t cluster_num) {
+  static std::array<char, cluster_size> zeros = {{0}};
+  write_cluster(cluster_num, zeros.data());
+}
 
 // Reads 1 cluster from the filestore into the pointer
 template<typename T>
 void read_cluster(size_t cluster_num, T* data) {
-  cout << "Reading from cluster " << cluster_num << endl;
+  //cout << "Reading from cluster " << cluster_num << endl;
   filestore.seekg(cluster_num*cluster_size);
   filestore.read(reinterpret_cast<char*>(data), cluster_size);
 }
+
+class disk_full_error_t {} disk_full_error;
 
 class FAT_t {
   std::vector<cluster_idx_t> FAT;
@@ -86,9 +96,9 @@ class FAT_t {
   // Sets a value in the in-memory FAT. DOES NOT persist
   void weak_set(size_t idx, cluster_idx_t val) {
     assert(idx >= data_start_block);
-    cout << "Writing " << val << " to FAT at index " << idx << endl;
+    //cout << "Writing " << val << " to FAT at index " << idx << endl;
     if (idx == val) {
-      cout << "WARNING: Making loop in FAT" << endl;
+      cerr << "ERROR: Making loop in FAT" << endl;
       exit(3);
     }
     FAT[idx-data_start_block] = val;
@@ -101,6 +111,10 @@ class FAT_t {
     const size_t cluster_idx = idx / cluster_size;
     write_cluster(fat_cluster + cluster_idx,
                   FAT.data() + cluster_idx*fat_entires_per_cluster);
+  }
+
+  void set_end(size_t idx) {
+    set(idx, end_of_file_cluster_marker);
   }
 
   // Gets a value from the in-memory FAT
@@ -130,22 +144,38 @@ class FAT_t {
   }
 } FAT;
 
+static cluster_idx_t get_free_cluster() {
+  // TODO: Use linked list. Change fill to iota in reset()
+  for (size_t i=data_start_block; i<fat_entries+data_start_block; ++i) {
+    if (FAT.get(i) == 0) {
+      return i;
+    }
+  }
+  //cerr << "Can't find any free clusters!" << endl;
+  throw disk_full_error;
+  return end_of_file_cluster_marker;
+}
+
 static const size_t directory_entry_size = 32;
 struct directory_entry {
   filesize_t size{0};
   cluster_idx_t starting_cluster{0};
-  struct {
-    // 0 if file, 1 if directory
+  struct flags {
     //unsigned char filetype : 1;
-    unsigned char filetype;
+    enum { FILE, DIRECTORY } filetype;
   } flags;
   static const size_t max_name_len = directory_entry_size - sizeof(size)
     - sizeof(starting_cluster) - sizeof(flags);
   std::array<char, max_name_len> name{{'\0'}};
+
+  bool is_valid() {
+    return name[0] != '\0';
+  }
+  void make_invalid() {
+    name[0] = '\0';
+  }
 };
 
-static const size_t files_in_dir_cluster = cluster_size / directory_entry_size;
-using directory = std::array<directory_entry, files_in_dir_cluster>;
 
 struct superblock {
   // other stuff I guess?
@@ -155,57 +185,114 @@ struct superblock {
   directory_entry root_directory_entry;
 };
 
+static void populate_dirent_with_dir(const string& name, directory_entry& d) {
+  d.starting_cluster = get_free_cluster();
+  d.flags.filetype = directory_entry::flags::DIRECTORY;
+  d.size = directory_size;
+
+  strncpy(d.name.data(), name.c_str(), d.name.size()-1);
+  d.name[d.name.size()-1] = '\0';
+
+  clear_cluster(d.starting_cluster);
+  //cout << "Setting FAT entry to end: " << d.starting_cluster << endl;
+  FAT.set_end(d.starting_cluster);
+}
+
 // A directory can iterate through its directory entries
-class directory_c {
-  cluster_idx_t start_cluster;
+class directory {
+  cluster_idx_t starting_cluster;
  public:
+  static const size_t files_in_dir_cluster
+    = cluster_size / directory_entry_size;
+
   class iterator
-      : public std::iterator<std::forward_iterator_tag, directory_entry> {
+      : public std::iterator<std::forward_iterator_tag, directory_entry>
+  {
 
-    friend class directory_c;
+    friend class directory;
     using dirent_array = std::array<directory_entry, files_in_dir_cluster>;
-    std::shared_ptr<dirent_array> data;
 
+    // Data members
+
+    // Pointer to currently-examined cluster
+    std::shared_ptr<dirent_array> data;
+    // Index within the cluster
     size_t dir_idx = 0;
+    // Cluster's number
     cluster_idx_t cur_cluster;
 
-    iterator(cluster_idx_t start_cluster)
-        : data(std::make_shared<dirent_array>()) {
-      cur_cluster = start_cluster;
+    iterator(cluster_idx_t starting_cluster)
+        : cur_cluster(starting_cluster)
+    {
+      //reread();
+    }
+
+    // Move to next entry, valid or not
+    void move_to_next_entry() {
+      if (!data) {
+        reread();
+      }
+
+      ++dir_idx;
+
+      if (dir_idx == files_in_dir_cluster) {
+        //cout << "Moving to next cluster" << endl;
+        cur_cluster = FAT.get(cur_cluster);
+        dir_idx = 0;
+        if (cur_cluster == end_of_file_cluster_marker) {
+          // The iterator's at the end, no point in keeping the old data around
+          data.reset();
+        } else {
+          reread();
+        }
+      }
+    }
+
+    // If current entry is valid, do nothing. Otherwise, move until the current
+    // entry is valid or we're at the end
+    void move_to_valid_entry_or_end() {
+      while (cur_cluster != end_of_file_cluster_marker
+               && !(*this)->is_valid()) {
+        move_to_next_entry();
+      }
+    }
+
+    // Reread from disk
+    void reread() {
+      if (!data.unique()) {
+        //cout << "Making new shared dirent array. use count = " << data.use_count() << " unique = " << data.unique() << endl;
+        data = std::make_shared<dirent_array>();
+      }
       read_cluster(cur_cluster, data->data());
     }
+    // Write to disk
+    void persist() {
+      write_cluster(cur_cluster, data->data());
+    }
+
 
    public:
     iterator() = default;
     iterator(const iterator&) = default;
     iterator& operator=(const iterator&) = default;
+    ~iterator() = default;
 
-    directory_entry operator*() const {
+    directory_entry& operator*() {
+      if (!data) reread();
       return (*data)[dir_idx];
     }
+
+    directory_entry* operator->() {
+      return &operator*();
+    }
+
+    // Skips over invalid directory entries
     iterator& operator++() {
-      if (dir_idx == files_in_dir_cluster) {
-        cur_cluster = FAT.get(cur_cluster);
-        dir_idx = 0;
-        if (cur_cluster == end_of_file_cluster_marker) {
-          // The iterator's at the end, no point in keeping the old directory
-          // around
-          data.reset();
-        } else {
-          if (!data.unique()) {
-            // Reset the pointer to new empty space
-            data = std::make_shared<dirent_array>();
-          }
-          read_cluster(cur_cluster, data->data());
-        }
-      } else {
-        ++dir_idx;
-      }
+      move_to_next_entry();
+      move_to_valid_entry_or_end();
       return *this;
     }
-    // not writing operator++(int) because it's stupid (would require
-    // allocation and deallocation every time it went over a cluster boundary).
-    // If someone wants to use the old value they can just use std::next()
+
     bool operator==(const iterator& other) {
       return dir_idx == other.dir_idx && cur_cluster == other.cur_cluster;
     }
@@ -214,15 +301,125 @@ class directory_c {
     }
   };
 
+  directory(const directory_entry& d)
+    : starting_cluster(d.starting_cluster)
+  {
+  }
+
   iterator begin() {
-    return iterator(start_cluster);
+    iterator ret(starting_cluster);
+    ret.move_to_valid_entry_or_end();
+    return ret;
+  }
+
+  // Returns an iterator that may start at an invalid dirent
+  iterator raw_begin() {
+    return iterator(starting_cluster);
   }
 
   iterator end() {
     return iterator(end_of_file_cluster_marker);
   }
 
+  // Finds an empty space in the directory and puts the directory_entry there
+  void add_directory_entry(const directory_entry& d) {
+    iterator prev_it(424242); // Invalid so we can check for the magic number
+
+    // This loop will always run at least once to prev_it will be set
+    for (iterator it = raw_begin(); it != end(); it.move_to_next_entry()) {
+      if (!it->is_valid()) {
+        it.reread();
+        *it = d;
+        it.persist();
+        return;
+      }
+      prev_it = it;
+    }
+
+    //cout << "add_directory_entry: Creating new cluster" << endl;
+    
+    // We need to create a new cluster! prev_it points to the last directory
+    // entry in the last cluster
+    cluster_idx_t new_cluster = get_free_cluster();
+    //cout << "add_directory_entry: Got a free cluster: " << new_cluster << endl;
+    FAT.set(prev_it.cur_cluster, new_cluster);
+    FAT.set_end(new_cluster);
+    clear_cluster(new_cluster);
+
+    //cout << "add_directory_entry: moving to next entry" << endl;
+    // Now that there's another cluster, prev_it will move to its first entry
+    prev_it.move_to_next_entry();
+    *prev_it = d;
+    //cout << "add_directory_entry: Persisting the iterator" << endl;
+    prev_it.persist();
+    //cout << "add_directory_entry: Done" << endl;
+  }
+
+  // XXX: Doesn't delete clusters if the directory can fit in fewer
+  void delete_directory_entry(iterator location) {
+    location.reread();
+    location->make_invalid();
+    location.persist();
+  }
+
+  void replace_directory_entry(iterator location, const directory_entry& d) {
+    location.reread();
+    *location = d;
+    location.persist();
+  }
+
+  //static int mkdir_at_directory_entry(
+  //    directory_entry& d, const string& name) {
+
+  //  d.starting_cluster = get_free_cluster();
+
+  //  strncpy(d.name.data(), name.c_str(), d.name.size()-1);
+  //  d.name[d.name.size()-1] = '\0';
+  //  d.size = directory_size;
+  //  d.flags.filetype = 1;
+
+  //  directory dir;
+  //  dir.write(dir.begin());
+
+  //  FAT.set_end(d.starting_cluster);
+
+  //  cout << "Made new directory, put it at cluster " << d.starting_cluster << endl;
+  //  return 0;
+  //}
+
+  //void add_cluster(directory_entry& dir_ent, cluster_idx_t last_cluster) {
+  //  cluster_idx_t new_cluster = get_free_cluster();
+
+  //  cout << "Putting new cluster at " << new_cluster << endl;
+  //  FAT.set(last_cluster, new_cluster);
+  //  FAT.set_end(new_cluster);
+
+  //  dir_ent.size += directory_size;
+
+  //  clear_cluster(new_cluster);
+  //}
+
+  void make_child_dir(const string& name) {
+    directory_entry new_dir_ent;
+    populate_dirent_with_dir(name, new_dir_ent);
+    add_directory_entry(new_dir_ent);
+  }
 };
+
+// Makes a directory entry for a directory with the given name and allocates
+// disk space for it
+directory_entry construct_dir_dir_ent(const string& name) {
+  directory_entry new_dir_ent;
+  new_dir_ent.starting_cluster = get_free_cluster();
+  new_dir_ent.flags.filetype = directory_entry::flags::DIRECTORY;
+  new_dir_ent.size = directory_size;
+
+  strncpy(new_dir_ent.name.data(), name.c_str(), new_dir_ent.name.size()-1);
+  new_dir_ent.name[new_dir_ent.name.size()-1] = '\0';
+
+  clear_cluster(new_dir_ent.starting_cluster);
+  return new_dir_ent;
+}
 
 bool break_off_last_path_entry(const string& path,
                                string& parent_path,
@@ -244,82 +441,65 @@ bool break_off_last_path_entry(const string& path,
 bool get_directory_entry_from_path(const string& path, directory_entry& ret) {
   // Base case: root directory
   if (path.length() == 1 && path[0] == directory_delim) {
-    cout << "Reading superblock to find root directory" << endl;
+    //cout << "Reading superblock to find root directory" << endl;
     superblock s;
     read_cluster(superblock_cluster, &s);
     ret = s.root_directory_entry;
-    cout << "Root direcotry is at cluster " << ret.starting_cluster << endl;
+    //cout << "Root directory is at cluster " << ret.starting_cluster << endl;
     return true;
   }
 
   string parent_path, child_name;
   if (!break_off_last_path_entry(path, parent_path, child_name)) {
-    cerr << "get_directory_from_path called on invalid path" << endl;
+    //cerr << "get_directory_from_path called on invalid path" << endl;
     return false;
   }
 
   // Recurse; get parent's directory entry
   directory_entry parent_directory_entry;
   if (!get_directory_entry_from_path(parent_path, parent_directory_entry)) {
-    cerr << "get_directory_entry_from_path called with nonexistant parent" << endl;
+    //cerr << "get_directory_entry_from_path called with nonexistant parent (full path " << path << endl;
     return false;
   }
-  if (!parent_directory_entry.flags.filetype) {
-    cerr << "get_directory_entry_from_path called with nondirectory" << endl;
+  //cout << "Got parent directory entry" << endl;
+  if (parent_directory_entry.flags.filetype
+      != directory_entry::flags::DIRECTORY) {
+    //cerr << "get_directory_entry_from_path called with nondirectory " << path << "<- its flags are " << parent_directory_entry.flags.filetype << endl;
     return false;
   }
 
 
   // If name ended with a /, we're done
   if (child_name.empty()) {
-    cout << "Path ended with a /, we're done" << endl;
+    //cout << "Path ended with a /, we're done" << endl;
     ret = parent_directory_entry;
     return true;
   }
 
-  cluster_idx_t parent_dir_cluster = parent_directory_entry.starting_cluster;
-  // Get parent's directory from their directory entry
-  do {
-    cout << "get_directory_entry_from_path reading from parent cluster " << parent_dir_cluster << endl;
-    directory parent_directory;
-    read_cluster(parent_dir_cluster, &parent_directory);
-
-    for (const directory_entry& d : parent_directory) {
-      if (child_name == d.name.data()) {
-        cout << "Found a match! " << child_name << " == " << d.name.data() << endl;
-        ret = d;
-        return true;
-      }
-    }
-    cout << "getattr couldn't find child; moving from cluster " << parent_dir_cluster;
-    parent_dir_cluster = FAT.get(parent_dir_cluster);
-    cout << " to cluster " << parent_dir_cluster << endl;
-  } while(parent_dir_cluster != end_of_file_cluster_marker);
-  cerr << "get_directory_from_path called with nonexistant child" << endl;
-  return false;
-}
-
-static cluster_idx_t find_next_free_cluster() {
-  for (size_t i=data_start_block; i<fat_entries+data_start_block; ++i) {
-    if (FAT.get(i) == 0) {
-      return i;
+  //cout << "Creating parent directory object" << endl;
+  directory parent_directory(parent_directory_entry);
+  for (const directory_entry& parent_dir_ent : parent_directory) {
+    //cout << "Iterating through dirents of parent" << endl;
+    if (child_name == parent_dir_ent.name.data()) {
+      ret = parent_dir_ent;
+      return true;
     }
   }
-  cerr << "Can't find any free clusters!" << endl;
-  return end_of_file_cluster_marker;
+  //cerr << "get_directory_from_path called with nonexistant child" << endl;
+  return false;
 }
 
 static int adam_getattr(const char *cpath, struct stat *stbuf)
 {
   string path(cpath);
 
-  cerr << "ADAM: adam_getattr called on ``" << path << "''" << endl;
+  cout<<term_yellow << "ADAM: adam_getattr called on ``" << path << "''" << term_reset<<endl;
 
   memset(stbuf, 0, sizeof(struct stat));
 
   directory_entry dir_ent;
   if (!get_directory_entry_from_path(path, dir_ent)) {
-    cerr << "getattr called on nonexistant file " << path << endl;
+    cerr << "[31;0mERROR: getattr called on nonexistant file " << path << "[0;m" << endl;
     return -ENOENT;
   }
 
@@ -349,6 +529,7 @@ static int adam_getattr(const char *cpath, struct stat *stbuf)
 static int adam_access(const char *cpath, int mask)
 {
   string path(cpath);
+  cout << term_yellow << "access called on " << path << term_reset << endl;
 
   directory_entry dir_ent;
   if (get_directory_entry_from_path(path, dir_ent)) {
@@ -371,45 +552,83 @@ static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
 {
   string path(cpath);
   size_t offset = signed_offset; // why is it given to us signed? :/
-  cerr << "ADAM: adam_readdir called on ``" << path << "'' with offset " << offset << endl;
+  cout <<term_yellow<< "ADAM: adam_readdir called on ``" << path << "'' with offset " << offset <<term_reset<< endl;
 
   directory_entry dir_ent;
   if (!get_directory_entry_from_path(path, dir_ent)) {
-    cout << "readdir called on nonexistant path" << endl;
+    cout <<term_red<< "readdir called on nonexistant path" << term_reset<<endl;
     return -ENOENT;
   }
   if (!dir_ent.flags.filetype) {
-    cout << "readdir called on file..." << endl;
+    cout <<term_red<< "readdir called on file..." <<term_reset<< endl;
     return -ENOTDIR;
   }
 
-  size_t absolute_offset = offset;
-  cluster_idx_t dir_cluster = dir_ent.starting_cluster;
-  // Get parent's directory from their directory entry
-  do {
-    directory dir;
-    read_cluster(dir_cluster, &dir);
+  directory dir(dir_ent);
 
-    for (size_t entry_num = offset;
-         entry_num < dir.size(); ++entry_num, ++absolute_offset) {
-      const directory_entry& d = dir[entry_num];
-
-      if (d.name[0] == '\0') {
-        break;
-      }
-
-      if (filler(buf, d.name.data(), nullptr, absolute_offset+1) != 0) {
+  // Loop over all the directory entries, PLUS "." and ".."
+  // The first two times, we'll use "." and "..", then start incrementing
+  // dir_iter to walk through the actual directory entries. If we see an
+  // invalid directory entry, we just ignore it. Also, if cur_fileno is less
+  // than offset, then that means we've already returned that file so we should
+  // skip it as well.
+  directory::iterator dir_iter = dir.begin();
+  for (size_t cur_fileno = 0; cur_fileno <= 1 || dir_iter != dir.end();) {
+    string name;
+    switch(cur_fileno) {
+      case 0: name = "."; break;
+      case 1: name = ".."; break;
+      default:
+              name = dir_iter->name.data();
+              ++dir_iter;
+              if (name[0] == '\0') {
+                cerr << "ERROR: dir iter returned invalid entry on fileno " << cur_fileno << endl;
+                exit(4);
+                continue;
+              }
+              break;
+    }
+    // Filler will fill the buffer for us using magic. If it returns nonzero, it
+    // means it wants us to return 0 as well. Then we'll be called back with
+    // cur_fileno+1, so we start returning the next entry properly
+    if (cur_fileno >= offset) {
+      if (filler(buf, name.c_str(), nullptr, cur_fileno+1) != 0) {
         return 0;
       }
     }
-    dir_cluster = FAT.get(dir_cluster);
-    if (offset >= files_in_dir_cluster) {
-      offset -= files_in_dir_cluster;
-    } else {
-      offset = 0;
-    }
-  } while(dir_cluster != end_of_file_cluster_marker);
+    ++cur_fileno;
+  }
   return 0;
+
+  // meh
+  //size_t cur_fileno = 0;
+  //if (cur_fileno >= offset) {
+  //  if (filler(buf, ".", nullptr, cur_fileno+1) != 0) {
+  //    return 0;
+  //  }
+  //}
+  //++cur_fileno;
+  //if (cur_fileno >= offset) {
+  //  if (filler(buf, "..", nullptr, cur_fileno+1) != 0) {
+  //    return 0;
+  //  }
+  //}
+  //++cur_fileno;
+
+  //directory dir(dir_ent);
+  //for (const directory_entry& d : dir) {
+  //  if (cur_fileno >= offset) {
+  //    if (d.name[0] == '\0') {
+  //      break;
+  //    }
+
+  //    if (filler(buf, d.name.data(), nullptr, cur_fileno+1) != 0) {
+  //      return 0;
+  //    }
+  //  }
+  //  ++cur_fileno;
+  //}
+  //return 0;
 }
 
 static int adam_mknod(const char *path, mode_t mode, dev_t rdev)
@@ -418,138 +637,99 @@ static int adam_mknod(const char *path, mode_t mode, dev_t rdev)
   return -ENOSYS;
 }
 
-// Makes a directory, puts info in given directory entry
-static int mkdir_at_directory_entry(
-    directory_entry& d, const string& name) {
-
-  strncpy(d.name.data(), name.c_str(), d.name.size()-1);
-  d.name[d.name.size()-1] = '\0';
-  d.size = directory_size;
-  d.starting_cluster = find_next_free_cluster();
-  if (d.starting_cluster == end_of_file_cluster_marker) {
-    cout << "Couldn't find a free cluster" << endl;
-    return -ENOSPC;
-  }
-  d.flags.filetype = 1;
-
-  FAT.set(d.starting_cluster, end_of_file_cluster_marker);
-
-  // Make the new directory and put . and .. into it
-  directory dir;
-  //directory_entry dot_dir_ent, dot_dot_dir_ent;
-
-  //dot_dir_ent = d;
-  //dot_dir_ent.name = {"."};
-
-  //dot_dot_dir_ent = parent_dir_ent;
-  //dot_dot_dir_ent.name = {".."};
-
-  //dir[0] = dot_dir_ent;
-  //dir[1] = dot_dot_dir_ent;
-
-  write_cluster(d.starting_cluster, &dir);
-
-  cout << "Made new directory, put it at cluster " << d.starting_cluster << endl;
-
-  return 0;
-}
 
 static int adam_mkdir(const char *cpath, mode_t mode)
 {
   string path(cpath);
 
-  cout << "mkdir called on path: " << path << endl;
+  //cout << "mkdir called on path: " << path << endl;
 
   string parent_path, child_name;
 
   if (child_name.length() >= directory_entry::max_name_len) {
-    cout << "mkdir: filename too long" << endl;
+    //cout << "mkdir: filename too long" << endl;
     return -ENAMETOOLONG;
   }
 
   if (!break_off_last_path_entry(path, parent_path, child_name)) {
-    cerr << "mkdir called on invalid path" << endl;
+    cerr <<term_red<< "mkdir called on invalid path" <<term_reset<< endl;
     return -ENOENT;
   }
 
   directory_entry parent_dir_ent;
   if (!get_directory_entry_from_path(parent_path, parent_dir_ent)) {
-    cout << "mkdir: parent path doesn't exist" << endl;
+    cout <<term_red<<"mkdir: parent path doesn't exist"<<term_reset << endl;
     return -ENOENT;
   }
 
-  cout << "Mkdir directory entry lookup succeeded" << endl;
+  //cout << "Mkdir directory entry lookup succeeded" << endl;
+  directory parent_dir(parent_dir_ent);
+  try {
+    parent_dir.make_child_dir(child_name);
+  } catch (disk_full_error_t) {
+    return -ENOSPC;
+  }
+  return 0;
 
 
-
-  cluster_idx_t parent_dir_cluster = parent_dir_ent.starting_cluster;
-  cluster_idx_t last_parent_dir_cluster;
-  // Get parent's directory from their directory entry
-  do {
-    do {
-      directory parent_directory;
-      read_cluster(parent_dir_cluster, &parent_directory);
-
-      for (directory_entry& d : parent_directory) {
-
-        if (d.name[0] == '\0') {
-          int err = mkdir_at_directory_entry(d, child_name);
-          if (err) {
-            cout << "mkdir: mkdir_at_directory_entry failed, returning " << err << endl;
-            return err;
-          }
-          write_cluster(parent_dir_cluster, &parent_directory);
-          cout << "Mkdir done" << endl;
-          return 0;
-        }
-      }
-      last_parent_dir_cluster = parent_dir_cluster;
-      parent_dir_cluster = FAT.get(parent_dir_cluster);
-    } while(parent_dir_cluster != end_of_file_cluster_marker);
-
-    // TODO: this should be abstracted somewhat
-
-    cout << "Parent directory too full to make new directory, "
-            "so we'll make it bigger! " << endl;
-
-    cluster_idx_t newparentcluster = find_next_free_cluster();
-    if (newparentcluster == end_of_file_cluster_marker) {
-      cout << "Filesystem too full to make new directory" << endl;
-      return -ENOSPC;
-    }
-    cout << "Putting new cluster at " << newparentcluster << endl;
-    FAT.set(last_parent_dir_cluster, newparentcluster);
-    FAT.set(newparentcluster, end_of_file_cluster_marker);
-    parent_dir_cluster = newparentcluster;
-
-    parent_dir_ent.size += directory_size;
-
-    directory parent_dir_extended;
-    write_cluster(parent_dir_cluster, &parent_dir_extended);
-    cout << "Done making new cluster" << endl;
-  } while(true);
-
-
-
-
-
-  //directory parent_dir;
-  //read_cluster(parent_dir_ent.starting_cluster, &parent_dir);
-
-  //for (size_t dir_entry_num = 0;
-  //     dir_entry_num < parent_dir.size();
-  //     ++dir_entry_num) {
-  //  directory_entry& d = parent_dir[dir_entry_num];
-  //  if (d.name[0] == '\0') {
-  //    int err = mkdir_at_directory_entry(d, child_name, parent_dir_ent);
-  //    if (err) {
-  //      return err;
-  //    }
-  //    write_cluster(parent_dir_ent.starting_cluster, &parent_dir);
-  //    cout << "Mkdir done" << endl;
-  //    return 0;
-  //  }
-  //}
+//  cluster_idx_t parent_dir_cluster = parent_dir_ent.starting_cluster;
+//  cluster_idx_t last_parent_dir_cluster;
+//  // Get parent's directory from their directory entry
+//  do {
+//      directory parent_directory(parent_dir_ent);
+//      for (directory_entry& d : parent_directory) {
+//        if (!d.is_valid()) {
+//          int err = directory::mkdir_at_directory_entry(d, child_name);
+//          if (err) {
+//            cout << "mkdir: mkdir_at_directory_entry failed, returning " << err << endl;
+//            return err;
+//          }
+//          write_cluster(parent_dir_cluster, &parent_directory);
+//          cout << "Mkdir done" << endl;
+//          return 0;
+//        }
+//      }
+//
+//    // TODO: this should be abstracted somewhat
+//
+//    cout << "Parent directory too full to make new directory, "
+//            "so we'll make it bigger! " << endl;
+//
+//    cluster_idx_t newparentcluster = get_free_cluster();
+//
+//    cout << "Putting new cluster at " << newparentcluster << endl;
+//    FAT.set(last_parent_dir_cluster, newparentcluster);
+//    FAT.set(newparentcluster, end_of_file_cluster_marker);
+//    parent_dir_cluster = newparentcluster;
+//
+//    parent_dir_ent.size += directory_size;
+//
+//    directory parent_dir_extended;
+//    write_cluster(parent_dir_cluster, &parent_dir_extended);
+//    cout << "Done making new cluster" << endl;
+//  } while(true);
+//
+//
+//
+//
+//
+//  //directory parent_dir;
+//  //read_cluster(parent_dir_ent.starting_cluster, &parent_dir);
+//
+//  //for (size_t dir_entry_num = 0;
+//  //     dir_entry_num < parent_dir.size();
+//  //     ++dir_entry_num) {
+//  //  directory_entry& d = parent_dir[dir_entry_num];
+//  //  if (d.name[0] == '\0') {
+//  //    int err = mkdir_at_directory_entry(d, child_name, parent_dir_ent);
+//  //    if (err) {
+//  //      return err;
+//  //    }
+//  //    write_cluster(parent_dir_ent.starting_cluster, &parent_dir);
+//  //    cout << "Mkdir done" << endl;
+//  //    return 0;
+//  //  }
+//  //}
 }
 
 static int adam_unlink(const char *path)
@@ -715,12 +895,10 @@ int main(int argc, char *argv[])
   static_assert(cluster_size > 0, "0 size cluster");
   static_assert(padded_fat_entries * cluster_idx_size == padded_fat_size,
       "cluster size not multiple of fat entry size");
-  static_assert(sizeof(directory) == cluster_size,
-      "Size of directory is not cluster size");
   static_assert(cluster_size > directory_entry_size+512,
       "directory entry too big to store root directory entry in superblock");
 
-  if (argc < 1) {
+  if (argc <= 1) {
     cerr << "First argument should be name of backing file" << endl;
     return 2;
   }
@@ -740,11 +918,7 @@ int main(int argc, char *argv[])
     FAT.reset();
 
     superblock sup;
-    int err = mkdir_at_directory_entry(sup.root_directory_entry, "/");
-    if (err) {
-      cerr << "Error creating root directory " << err << endl;
-      return -1;
-    }
+    populate_dirent_with_dir("/", sup.root_directory_entry);
     write_cluster(superblock_cluster, &sup);
 
     filestore.close();
