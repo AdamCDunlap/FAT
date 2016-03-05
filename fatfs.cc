@@ -83,13 +83,32 @@ void read_cluster(size_t cluster_num, T* data) {
   filestore.read(reinterpret_cast<char*>(data), cluster_size);
 }
 
-class disk_full_error_t {} disk_full_error;
+// Define exceptions
+struct filesystem_error {
+  virtual int errno_error_code() const = 0;
+};
+
+struct disk_full_error_t : filesystem_error {
+  int errno_error_code() const override { return -ENOSPC; }
+} disk_full_error;
+
+struct invalid_path_error_t : filesystem_error {
+  int errno_error_code() const override { return -ENOENT; }
+} invalid_path_error;
+
+struct directory_expected_error_t : filesystem_error {
+  int errno_error_code () const override { return -ENOTDIR; }
+} directory_expected_error;
+
+struct nonexistant_file_error_t : filesystem_error {
+  int errno_error_code () const override { return -ENOENT; }
+} nonexistant_file_error;
 
 class FAT_t {
-  std::vector<cluster_idx_t> FAT;
+  std::vector<cluster_idx_t> FAT_vec;
  public:
 
-  FAT_t() : FAT(padded_fat_entries)
+  FAT_t() : FAT_vec(padded_fat_entries)
   {
   }
 
@@ -101,7 +120,7 @@ class FAT_t {
       cerr << "ERROR: Making loop in FAT" << endl;
       exit(3);
     }
-    FAT[idx-data_start_block] = val;
+    FAT_vec[idx-data_start_block] = val;
   }
 
   // Sets a value in the FAT and persists the change to disk
@@ -110,7 +129,7 @@ class FAT_t {
 
     const size_t cluster_idx = idx / cluster_size;
     write_cluster(fat_cluster + cluster_idx,
-                  FAT.data() + cluster_idx*fat_entires_per_cluster);
+                  FAT_vec.data() + cluster_idx*fat_entires_per_cluster);
   }
 
   void set_end(size_t idx) {
@@ -119,19 +138,19 @@ class FAT_t {
 
   // Gets a value from the in-memory FAT
   cluster_idx_t get(size_t idx) {
-    return FAT[idx-data_start_block];
+    return FAT_vec[idx-data_start_block];
   }
   
   // Loads the FAT from the filestore file
   void load() {
     for (size_t i=0; i < fat_clusters; ++i) {
-      read_cluster(fat_cluster+i, FAT.data() + i*fat_entires_per_cluster);
+      read_cluster(fat_cluster+i, FAT_vec.data() + i*fat_entires_per_cluster);
     }
   }
 
   // Resets the FAT to all 0's
   void reset() {
-    std::fill(FAT.begin(), FAT.end(), 0);
+    std::fill(FAT_vec.begin(), FAT_vec.end(), 0);
     persist();
   }
 
@@ -139,11 +158,43 @@ class FAT_t {
   void persist() {
     for(size_t cluster_idx=0; cluster_idx<fat_clusters; ++cluster_idx) {
       write_cluster(fat_cluster + cluster_idx,
-                    FAT.data() + cluster_idx*fat_entires_per_cluster);
+                    FAT_vec.data() + cluster_idx*fat_entires_per_cluster);
     }
   }
+
+
+  class iterator {
+    cluster_idx_t cur_cluster;
+   public:
+    iterator(cluster_idx_t starting_cluster)
+      : cur_cluster(starting_cluster) 
+    {}
+    cluster_idx_t operator*() const {
+      return cur_cluster;
+    }
+    iterator& operator++();
+
+    bool operator==(iterator other) const {
+      return cur_cluster == other.cur_cluster;
+    }
+    bool operator!=(iterator other) const {
+      return !(*this == other);
+    }
+  };
+
+  iterator end() const {
+    return iterator(end_of_file_cluster_marker);
+  }
+
 } FAT;
 
+FAT_t::iterator& FAT_t::iterator::operator++() {
+  cur_cluster = FAT.get(cur_cluster);
+  return *this;
+}
+
+// Returns the cluster number of a free cluster. Throws disk_full_error if
+// there are no free clusters.
 static cluster_idx_t get_free_cluster() {
   // TODO: Use linked list. Change fill to iota in reset()
   for (size_t i=data_start_block; i<fat_entries+data_start_block; ++i) {
@@ -218,11 +269,11 @@ class directory {
     std::shared_ptr<dirent_array> data;
     // Index within the cluster
     size_t dir_idx = 0;
-    // Cluster's number
-    cluster_idx_t cur_cluster;
+    // Which cluster we're on
+    FAT_t::iterator cluster_itr;
 
     iterator(cluster_idx_t starting_cluster)
-        : cur_cluster(starting_cluster)
+        : cluster_itr(starting_cluster)
     {
       //reread();
     }
@@ -237,9 +288,9 @@ class directory {
 
       if (dir_idx == files_in_dir_cluster) {
         //cout << "Moving to next cluster" << endl;
-        cur_cluster = FAT.get(cur_cluster);
+        ++cluster_itr;
         dir_idx = 0;
-        if (cur_cluster == end_of_file_cluster_marker) {
+        if (cluster_itr == FAT.end()) {
           // The iterator's at the end, no point in keeping the old data around
           data.reset();
         } else {
@@ -251,8 +302,7 @@ class directory {
     // If current entry is valid, do nothing. Otherwise, move until the current
     // entry is valid or we're at the end
     void move_to_valid_entry_or_end() {
-      while (cur_cluster != end_of_file_cluster_marker
-               && !(*this)->is_valid()) {
+      while (cluster_itr != FAT.end() && !(*this)->is_valid()) {
         move_to_next_entry();
       }
     }
@@ -263,11 +313,11 @@ class directory {
         //cout << "Making new shared dirent array. use count = " << data.use_count() << " unique = " << data.unique() << endl;
         data = std::make_shared<dirent_array>();
       }
-      read_cluster(cur_cluster, data->data());
+      read_cluster(*cluster_itr, data->data());
     }
     // Write to disk
     void persist() {
-      write_cluster(cur_cluster, data->data());
+      write_cluster(*cluster_itr, data->data());
     }
 
 
@@ -294,16 +344,21 @@ class directory {
     }
 
     bool operator==(const iterator& other) {
-      return dir_idx == other.dir_idx && cur_cluster == other.cur_cluster;
+      return dir_idx == other.dir_idx && cluster_itr == other.cluster_itr;
     }
     bool operator!=(const iterator& other) {
       return !(*this == other);
     }
   };
 
+  // Constructs directory based off the directory entry. If the given entry is
+  // not a directory, throw directory_expected_error
   directory(const directory_entry& d)
     : starting_cluster(d.starting_cluster)
   {
+    if (d.flags.filetype != directory_entry::flags::DIRECTORY) {
+      throw directory_expected_error;
+    }
   }
 
   iterator begin() {
@@ -342,7 +397,7 @@ class directory {
     // entry in the last cluster
     cluster_idx_t new_cluster = get_free_cluster();
     //cout << "add_directory_entry: Got a free cluster: " << new_cluster << endl;
-    FAT.set(prev_it.cur_cluster, new_cluster);
+    FAT.set(*prev_it.cluster_itr, new_cluster);
     FAT.set_end(new_cluster);
     clear_cluster(new_cluster);
 
@@ -390,72 +445,63 @@ directory_entry construct_dir_dir_ent(const string& name) {
   return new_dir_ent;
 }
 
-bool break_off_last_path_entry(const string& path,
-                               string& parent_path,
-                               string& child_name) {
+// Given path, return the child name (part after last /) and parent name (the
+// rest of it, not including the /. For now, return / for root directory.
+// Throws invalid_path_error if path doesn't have a / in it
+// TODO: Change it to empty string?
+std::tuple<string, string> break_off_last_path_entry(const string& path) {
+
   size_t last_delim_pos = path.find_last_of(directory_delim);
   if (last_delim_pos == string::npos) {
-    return false;
+    throw invalid_path_error;
   }
 
-  parent_path = path.substr(0, last_delim_pos);
-  child_name = path.substr(last_delim_pos+1);
+  string parent_path = path.substr(0, last_delim_pos);
   
   if (parent_path.empty()) {
     parent_path.push_back(directory_delim);
   }
-  return true;
+  // Return (parent, child)
+  return std::make_tuple(parent_path, path.substr(last_delim_pos+1));
 }
 
-bool get_directory_entry_from_path(const string& path, directory_entry& ret) {
+// Returns the directory entry corresponding to the path. Throws
+// directory_expected_error if the part before the / is not a directory. Throws
+// nonexistant_file_error if the file doesn't exist
+directory_entry get_directory_entry_from_path(const string& path) {
   // Base case: root directory
   if (path.length() == 1 && path[0] == directory_delim) {
     //cout << "Reading superblock to find root directory" << endl;
     superblock s;
     read_cluster(superblock_cluster, &s);
-    ret = s.root_directory_entry;
-    //cout << "Root directory is at cluster " << ret.starting_cluster << endl;
-    return true;
+    return s.root_directory_entry;
   }
 
   string parent_path, child_name;
-  if (!break_off_last_path_entry(path, parent_path, child_name)) {
-    //cerr << "get_directory_from_path called on invalid path" << endl;
-    return false;
-  }
+  std::tie(parent_path, child_name) = break_off_last_path_entry(path);
 
   // Recurse; get parent's directory entry
-  directory_entry parent_directory_entry;
-  if (!get_directory_entry_from_path(parent_path, parent_directory_entry)) {
-    //cerr << "get_directory_entry_from_path called with nonexistant parent (full path " << path << endl;
-    return false;
-  }
-  //cout << "Got parent directory entry" << endl;
+  directory_entry parent_directory_entry
+    = get_directory_entry_from_path(parent_path);
+
   if (parent_directory_entry.flags.filetype
       != directory_entry::flags::DIRECTORY) {
-    //cerr << "get_directory_entry_from_path called with nondirectory " << path << "<- its flags are " << parent_directory_entry.flags.filetype << endl;
-    return false;
+    throw directory_expected_error;
   }
 
 
   // If name ended with a /, we're done
   if (child_name.empty()) {
-    //cout << "Path ended with a /, we're done" << endl;
-    ret = parent_directory_entry;
-    return true;
+    return parent_directory_entry;
   }
 
-  //cout << "Creating parent directory object" << endl;
   directory parent_directory(parent_directory_entry);
   for (const directory_entry& parent_dir_ent : parent_directory) {
-    //cout << "Iterating through dirents of parent" << endl;
     if (child_name == parent_dir_ent.name.data()) {
-      ret = parent_dir_ent;
-      return true;
+      return parent_dir_ent;
     }
   }
-  //cerr << "get_directory_from_path called with nonexistant child" << endl;
-  return false;
+  throw nonexistant_file_error;
 }
 
 static int adam_getattr(const char *cpath, struct stat *stbuf)
@@ -466,33 +512,34 @@ static int adam_getattr(const char *cpath, struct stat *stbuf)
 
   memset(stbuf, 0, sizeof(struct stat));
 
-  directory_entry dir_ent;
-  if (!get_directory_entry_from_path(path, dir_ent)) {
-    cerr << "[31;0mERROR: getattr called on nonexistant file " << path << "[0;m" << endl;
-    return -ENOENT;
+  try {
+    directory_entry dir_ent = get_directory_entry_from_path(path);
+
+    if (dir_ent.flags.filetype) {
+      stbuf->st_mode = S_IFDIR | 0755;
+      stbuf->st_nlink = 2;
+    } else {
+      stbuf->st_mode = S_IFREG | 0644;
+      stbuf->st_nlink = 1;
+    }
+
+    stbuf->st_size = dir_ent.size;
+
+    //stbuf->st_uid = getuid();
+    //stbuf->st_gid = getgid();
+    //stbuf->st_rdev = 0;
+
+    //stbuf->st_blocks = 3;
+    //struct timespec time0 = {1455428262, 0};
+    //stbuf->st_atim = time0;
+    //stbuf->st_mtim = time0;
+    //stbuf->st_ctim = time0;
+
+    return 0;
+
+  } catch (const filesystem_error& e) {
+    return e.errno_error_code();
   }
-
-  if (dir_ent.flags.filetype) {
-    stbuf->st_mode = S_IFDIR | 0755;
-    stbuf->st_nlink = 2;
-  } else {
-    stbuf->st_mode = S_IFREG | 0644;
-    stbuf->st_nlink = 1;
-  }
-
-  stbuf->st_size = dir_ent.size;
-
-  //stbuf->st_uid = getuid();
-  //stbuf->st_gid = getgid();
-  //stbuf->st_rdev = 0;
-
-  //stbuf->st_blocks = 3;
-  //struct timespec time0 = {1455428262, 0};
-  //stbuf->st_atim = time0;
-  //stbuf->st_mtim = time0;
-  //stbuf->st_ctim = time0;
-
-  return 0;
 }
 
 static int adam_access(const char *cpath, int mask)
@@ -500,13 +547,17 @@ static int adam_access(const char *cpath, int mask)
   string path(cpath);
   cout << term_yellow << "access called on " << path << term_reset << endl;
 
-  directory_entry dir_ent;
-  if (get_directory_entry_from_path(path, dir_ent)) {
-    if (dir_ent.flags.filetype || !(mask & X_OK)) {
+  try {
+    directory_entry dir_ent = get_directory_entry_from_path(path);
+    if (dir_ent.flags.filetype == directory_entry::flags::DIRECTORY
+        || !(mask & X_OK)) {
       return 0;
+    } else {
+      return -EACCES;
     }
+  } catch (const filesystem_error& e) {
+    return e.errno_error_code();
   }
-  return -1;
 }
 
 static int adam_readlink(const char *path, char *buf, size_t size)
@@ -523,57 +574,54 @@ static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
   size_t offset = signed_offset; // why is it given to us signed? :/
   cout <<term_yellow<< "ADAM: adam_readdir called on ``" << path << "'' with offset " << offset <<term_reset<< endl;
 
-  directory_entry dir_ent;
-  if (!get_directory_entry_from_path(path, dir_ent)) {
-    cout <<term_red<< "readdir called on nonexistant path" << term_reset<<endl;
-    return -ENOENT;
-  }
-  if (!dir_ent.flags.filetype) {
-    cout <<term_red<< "readdir called on file..." <<term_reset<< endl;
-    return -ENOTDIR;
-  }
+  try {
+    directory_entry dir_ent = get_directory_entry_from_path(path);
+    directory dir(dir_ent);
 
-  directory dir(dir_ent);
-
-  // Loop over all the directory entries, PLUS "." and ".."
-  // The first two times, we'll use "." and "..", then start incrementing
-  // dir_iter to walk through the actual directory entries. If we see an
-  // invalid directory entry, we just ignore it. Also, if cur_fileno is less
-  // than offset, then that means we've already returned that file so we should
-  // skip it as well.
-  directory::iterator dir_iter = dir.begin();
-  for (size_t cur_fileno = 0; cur_fileno <= 1 || dir_iter != dir.end();) {
-    string name;
-    switch(cur_fileno) {
-      case 0: name = "."; break;
-      case 1: name = ".."; break;
-      default:
-              name = dir_iter->name.data();
-              ++dir_iter;
-              if (name[0] == '\0') {
-                cerr << "ERROR: dir iter returned invalid entry on fileno " << cur_fileno << endl;
-                exit(4);
-                continue;
-              }
-              break;
-    }
-    // Filler will fill the buffer for us using magic. If it returns nonzero, it
-    // means it wants us to return 0 as well. Then we'll be called back with
-    // cur_fileno+1, so we start returning the next entry properly
-    if (cur_fileno >= offset) {
-      if (filler(buf, name.c_str(), nullptr, cur_fileno+1) != 0) {
-        return 0;
+    // Loop over all the directory entries, PLUS "." and ".."
+    // The first two times, we'll use "." and "..", then start incrementing
+    // dir_iter to walk through the actual directory entries. If we see an
+    // invalid directory entry, we just ignore it. Also, if cur_fileno is less
+    // than offset, then that means we've already returned that file so we should
+    // skip it as well.
+    directory::iterator dir_iter = dir.begin();
+    for (size_t cur_fileno = 0; cur_fileno <= 1 || dir_iter != dir.end();) {
+      string name;
+      switch(cur_fileno) {
+        case 0: name = "."; break;
+        case 1: name = ".."; break;
+        default:
+                name = dir_iter->name.data();
+                ++dir_iter;
+                if (name[0] == '\0') {
+                  cerr << "ERROR: dir iter returned invalid entry on fileno " << cur_fileno << endl;
+                  exit(4);
+                  continue;
+                }
+                break;
       }
+      // Filler will fill the buffer for us using magic. If it returns nonzero, it
+      // means it wants us to return 0 as well. Then we'll be called back with
+      // cur_fileno+1, so we start returning the next entry properly
+      if (cur_fileno >= offset) {
+        if (filler(buf, name.c_str(), nullptr, cur_fileno+1) != 0) {
+          return 0;
+        }
+      }
+      ++cur_fileno;
     }
-    ++cur_fileno;
+    return 0;
+  } catch (const filesystem_error& e) {
+    return e.errno_error_code();
   }
-  return 0;
 
 }
 
 static int adam_mknod(const char *path, mode_t mode, dev_t rdev)
 {
   fprintf(stderr, "ADAM: adam_mknod not implemented\n");
+
+
   return -ENOSYS;
 }
 
@@ -582,35 +630,22 @@ static int adam_mkdir(const char *cpath, mode_t mode)
 {
   string path(cpath);
 
-  //cout << "mkdir called on path: " << path << endl;
-
-  string parent_path, child_name;
-
-  if (child_name.length() >= directory_entry::max_name_len) {
-    //cout << "mkdir: filename too long" << endl;
-    return -ENAMETOOLONG;
-  }
-
-  if (!break_off_last_path_entry(path, parent_path, child_name)) {
-    cerr <<term_red<< "mkdir called on invalid path" <<term_reset<< endl;
-    return -ENOENT;
-  }
-
-  directory_entry parent_dir_ent;
-  if (!get_directory_entry_from_path(parent_path, parent_dir_ent)) {
-    cout <<term_red<<"mkdir: parent path doesn't exist"<<term_reset << endl;
-    return -ENOENT;
-  }
-
-  //cout << "Mkdir directory entry lookup succeeded" << endl;
-  directory parent_dir(parent_dir_ent);
   try {
-    parent_dir.make_child_dir(child_name);
-  } catch (disk_full_error_t) {
-    return -ENOSPC;
-  }
-  return 0;
+    string parent_path, child_name;
+    std::tie(parent_path, child_name) = break_off_last_path_entry(path);
 
+    if (child_name.length() >= directory_entry::max_name_len) {
+      return -ENAMETOOLONG;
+    }
+
+    directory_entry parent_dir_ent = get_directory_entry_from_path(parent_path);
+    directory parent_dir(parent_dir_ent);
+    parent_dir.make_child_dir(child_name);
+
+    return 0;
+  } catch(const filesystem_error& e) {
+    return e.errno_error_code();
+  }
 }
 
 static int adam_unlink(const char *path)
@@ -717,36 +752,48 @@ static int adam_read(const char *cpath, char *buf, size_t size, off_t offset,
         return res;
 }
 
-static int adam_write(const char *cpath, const char *buf, size_t size,
-                     off_t offset, struct fuse_file_info *fi)
+static int adam_write(const char *cpath, const char *buf, size_t big_size,
+                     off_t signed_offset, struct fuse_file_info *fi)
 {
   string path(cpath);
-  if (path == "/adam") {
-    const size_t new_file_size =
-      std::max(adam_file_contents.length(), size+offset);
-    adam_file_contents.resize(new_file_size);
-    auto offset_file_contents_it =
-      std::next(adam_file_contents.begin(), offset);
-    std::copy_n(buf, size, offset_file_contents_it);
-    return size;
-  } else {
-    return -1;
+  filesize_t offset = signed_offset;
+  filesize_t size = big_size;
+  try {
+    directory_entry dir_ent = get_directory_entry_from_path(path);
+    const filesize_t new_file_size = std::max(dir_ent.size, size+offset);
+
+    // TODO
+
+    return 0;
+  } catch (const filesystem_error& e) {
+    return e.errno_error_code();
   }
+  //if (path == "/adam") {
+  //  const size_t new_file_size =
+  //    std::max(adam_file_contents.length(), size+offset);
+  //  adam_file_contents.resize(new_file_size);
+  //  auto offset_file_contents_it =
+  //    std::next(adam_file_contents.begin(), offset);
+  //  std::copy_n(buf, size, offset_file_contents_it);
+  //  return size;
+  //} else {
+  //  return -1;
+  //}
 
-        int fd;
-        int res;
+  //      int fd;
+  //      int res;
 
-        (void) fi;
-        fd = open(cpath, O_WRONLY);
-        if (fd == -1)
-                return -errno;
+  //      (void) fi;
+  //      fd = open(cpath, O_WRONLY);
+  //      if (fd == -1)
+  //              return -errno;
 
-        res = pwrite(fd, buf, size, offset);
-        if (res == -1)
-                res = -errno;
+  //      res = pwrite(fd, buf, size, offset);
+  //      if (res == -1)
+  //              res = -errno;
 
-        close(fd);
-        return res;
+  //      close(fd);
+  //      return res;
 }
 
 static int adam_statfs(const char *path, struct statvfs *stbuf)
