@@ -31,7 +31,6 @@ using filesize_t = uint32_t;
 static const filesize_t filestore_size = 10*1024*1024;
 static const filesize_t cluster_size = 4*1024;
 
-string adam_file_contents("Hello there\n");
 static std::fstream filestore;
 
 static const size_t cluster_idx_size = sizeof(cluster_idx_t);
@@ -62,9 +61,9 @@ static const string term_reset = "[0;0m";
 template<typename T>
 void write_cluster(size_t cluster_num, const T* data) {
   //cout << "Writing to cluster " << cluster_num << endl;
-  //if (cluster_num == superblock_cluster) {
-  //  cout << "[32;1mWARNING: Writing to superblock cluster![0;0m" << endl;
-  //}
+  if (cluster_num == superblock_cluster) {
+    cout << term_red << "WARNING: Writing to superblock cluster!" << term_reset << endl;
+  }
 
   filestore.seekp(cluster_num * cluster_size);
   filestore.write(reinterpret_cast<const char*>(data), cluster_size);
@@ -108,6 +107,8 @@ struct name_too_long_error_t : filesystem_error {
   int errno_error_code() const override { return -ENAMETOOLONG; }
 } name_too_long_error;
 
+struct end_of_file_exception_t {} end_of_file_exception;
+
 class FAT_t {
   std::vector<cluster_idx_t> FAT_vec;
  public:
@@ -136,6 +137,10 @@ class FAT_t {
                   FAT_vec.data() + cluster_idx*fat_entires_per_cluster);
   }
 
+  void free(size_t idx) {
+    set(idx, 0);
+  }
+
   void set_end(size_t idx) {
     set(idx, end_of_file_cluster_marker);
   }
@@ -144,7 +149,7 @@ class FAT_t {
   cluster_idx_t get(size_t idx) {
     return FAT_vec[idx-data_start_block];
   }
-  
+
   // Loads the FAT from the filestore file
   void load() {
     for (size_t i=0; i < fat_clusters; ++i) {
@@ -167,11 +172,13 @@ class FAT_t {
   }
 
 
-  class iterator {
+  class iterator
+    : public std::iterator<std::forward_iterator_tag, cluster_idx_t>
+  {
     cluster_idx_t cur_cluster;
    public:
     iterator(cluster_idx_t starting_cluster)
-      : cur_cluster(starting_cluster) 
+      : cur_cluster(starting_cluster)
     {}
     cluster_idx_t operator*() const {
       return cur_cluster;
@@ -194,10 +201,13 @@ class FAT_t {
 } FAT;
 
 FAT_t::iterator& FAT_t::iterator::operator++() {
+  if (*this == FAT.end()) {
+    throw end_of_file_exception;
+  }
   cur_cluster = FAT.get(cur_cluster);
   return *this;
 }
-  
+
 // Returns the cluster number of a free cluster. Throws disk_full_error if
 // there are no free clusters.
 static cluster_idx_t get_free_cluster() {
@@ -324,19 +334,6 @@ class directory {
       }
     }
 
-    // Reread from disk
-    void reread() {
-      if (!data.unique()) {
-        //cout << "Making new shared dirent array. use count = " << data.use_count() << " unique = " << data.unique() << endl;
-        data = std::make_shared<dirent_array>();
-      }
-      read_cluster(*cluster_itr, data->data());
-    }
-    // Write to disk
-    void persist() {
-      write_cluster(*cluster_itr, data->data());
-    }
-
 
    public:
     iterator() = default;
@@ -345,8 +342,12 @@ class directory {
     ~iterator() = default;
 
     directory_entry& operator*() {
-      if (!data) reread();
-      return (*data)[dir_idx];
+      if (*cluster_itr == 0) {
+        return superblock.root_directory_entry;
+      } else {
+        if (!data) reread();
+        return (*data)[dir_idx];
+      }
     }
 
     directory_entry* operator->() {
@@ -365,6 +366,23 @@ class directory {
     }
     bool operator!=(const iterator& other) {
       return !(*this == other);
+    }
+
+    // Reread from disk
+    void reread() {
+      if (!data.unique()) {
+        //cout << "Making new shared dirent array. use count = " << data.use_count() << " unique = " << data.unique() << endl;
+        data = std::make_shared<dirent_array>();
+      }
+      read_cluster(*cluster_itr, data->data());
+    }
+    // Write to disk
+    void persist() {
+      if (*cluster_itr == 0) {
+        write_cluster(0, &superblock);
+      } else {
+        write_cluster(*cluster_itr, data->data());
+      }
     }
   };
 
@@ -389,8 +407,12 @@ class directory {
     return iterator(starting_cluster);
   }
 
-  iterator end() {
+  static iterator end() {
     return iterator(end_of_file_cluster_marker);
+  }
+
+  static iterator root_directory_iter() {
+    return iterator(0);
   }
 
   // Finds an empty space in the directory and puts the directory_entry there
@@ -428,13 +450,13 @@ class directory {
   }
 
   // XXX: Doesn't delete clusters if the directory can fit in fewer
-  void delete_directory_entry(iterator location) {
+  static void delete_directory_entry(iterator location) {
     location.reread();
     location->make_invalid();
     location.persist();
   }
 
-  void replace_directory_entry(iterator location, const directory_entry& d) {
+  static void replace_directory_entry(iterator location, const directory_entry& d) {
     //location.reread();
     *location = d;
     location.persist();
@@ -492,7 +514,7 @@ directory::iterator get_directory_entry_iter_from_path(const string& path) {
     //superblock s;
     //read_cluster(superblock_cluster, &s);
     //return directory::rootdir_it();
-    return superblock.root_directory_entry;
+    return directory::root_directory_iter();
   }
 
   string parent_path, child_name;
@@ -516,18 +538,31 @@ directory::iterator get_directory_entry_iter_from_path(const string& path) {
   }
 
   directory parent_directory(*parent_directory_entry_it);
-  for (directory::iterator it = parent_directory.begin();
-      it != parent_directory.end(); ++it) {
+  directory::iterator it = parent_directory.begin();
+
+  cout << "Before loop" << endl;
+  while(it != parent_directory.end()) {
     if (child_name == it->name.data()) {
       return it;
     }
+    cout << "Before increment" << endl;
+    ++it;
+    cout << "After increment" << endl;
   }
+  cout << "After loop" << endl;
+
+  ///for (directory::iterator it = parent_directory.begin();
+  ///    it != parent_directory.end(); ++it) {
+  ///  if (child_name == it->name.data()) {
+  ///    return it;
+  ///  }
+  //}
   throw nonexistant_file_error;
 }
 
 static int adam_getattr(const char *cpath, struct stat *stbuf)
 {
-  string path(cpath);
+  const string path(cpath);
 
   cout<<term_yellow << "ADAM: adam_getattr called on ``" << path << "''" << term_reset<<endl;
 
@@ -566,7 +601,7 @@ static int adam_getattr(const char *cpath, struct stat *stbuf)
 
 static int adam_access(const char *cpath, int mask)
 {
-  string path(cpath);
+  const string path(cpath);
   cout << term_yellow << "access called on " << path << term_reset << endl;
 
   try {
@@ -578,13 +613,14 @@ static int adam_access(const char *cpath, int mask)
       return -EACCES;
     }
   } catch (const filesystem_error& e) {
+    cerr << term_red << "access failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
 }
 
 static int adam_readlink(const char *path, char *buf, size_t size)
 {
-  fprintf(stderr, "ADAM: adam_readlink not implemented\n");
+  cerr << term_yellow << "readlink not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
@@ -592,7 +628,7 @@ static int adam_readlink(const char *path, char *buf, size_t size)
 static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
                        off_t signed_offset, struct fuse_file_info *fi)
 {
-  string path(cpath);
+  const string path(cpath);
   size_t offset = signed_offset; // why is it given to us signed? :/
   cout <<term_yellow<< "ADAM: adam_readdir called on ``" << path << "'' with offset " << offset <<term_reset<< endl;
 
@@ -634,6 +670,7 @@ static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
     }
     return 0;
   } catch (const filesystem_error& e) {
+    cerr << term_red << "access failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
 
@@ -641,7 +678,7 @@ static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
 
 static int adam_mknod(const char *cpath, mode_t mode, dev_t rdev)
 {
-  string path(cpath);
+  const string path(cpath);
 
   cout << term_yellow << "mknod called on " << path << term_reset << endl;
 
@@ -670,6 +707,7 @@ static int adam_mknod(const char *cpath, mode_t mode, dev_t rdev)
 
     return 0;
   } catch (const filesystem_error& e) {
+    cerr << term_red << "mknod failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
 }
@@ -677,7 +715,7 @@ static int adam_mknod(const char *cpath, mode_t mode, dev_t rdev)
 
 static int adam_mkdir(const char *cpath, mode_t mode)
 {
-  string path(cpath);
+  const string path(cpath);
 
   try {
     string parent_path, child_name;
@@ -688,66 +726,102 @@ static int adam_mkdir(const char *cpath, mode_t mode)
 
     return 0;
   } catch(const filesystem_error& e) {
+    cerr << term_red << "mkdir failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
 }
 
 static int adam_unlink(const char *path)
 {
-  fprintf(stderr, "ADAM: adam_unlink not implemented\n");
+  cerr << term_yellow << "unlink not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_rmdir(const char *path)
 {
-  fprintf(stderr, "ADAM: adam_rmdir not implemented\n");
+  cerr << term_yellow << "rmdir not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_symlink(const char *to, const char *from)
 {
-  fprintf(stderr, "ADAM: adam_symlink not implemented\n");
+  cerr << term_yellow << "symlink not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_rename(const char *from, const char *to)
 {
-  fprintf(stderr, "ADAM: adam_rename not implemented\n");
+  cerr << term_yellow << "rename not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_link(const char *from, const char *to)
 {
-  fprintf(stderr, "ADAM: adam_link not implemented\n");
+  cerr << term_yellow << "link not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_chmod(const char *path, mode_t mode)
 {
-  fprintf(stderr, "ADAM: adam_chmod not implemented\n");
+  cerr << term_yellow << "chmod not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_chown(const char *path, uid_t uid, gid_t gid)
 {
-  fprintf(stderr, "ADAM: adam_chown not implemented\n");
+  cerr << term_yellow << "chown not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_truncate(const char *cpath, off_t size)
 {
-  string path(cpath);
-  if (path == "/adam") {
-    adam_file_contents.resize(size);
+  const string path(cpath);
+  try {
+    directory::iterator dir_ent_itr = get_directory_entry_iter_from_path(path);
+    directory_entry dir_ent = *dir_ent_itr;
+
+    // size/cluster_size, rounded up
+    size_t new_num_clusters = (size + cluster_size - 1) / cluster_size;
+    size_t old_num_clusters = (dir_ent.size + cluster_size - 1) / cluster_size;
+
+    if (size == dir_ent.size) {
+      return 0;
+    }
+    FAT_t::iterator file_cluster_it(dir_ent.starting_cluster);
+    if (new_num_clusters > old_num_clusters) {
+      long i = 0;
+      for (; i < static_cast<long>(old_num_clusters)-1; ++i) {
+        ++file_cluster_it;
+      }
+      for (; i<static_cast<long>(new_num_clusters)-1; ++i) {
+        cluster_idx_t next_cluster = create_zeroed_end_cluster();
+        FAT.set(*file_cluster_it, next_cluster);
+        ++file_cluster_it;
+      }
+    } else {
+      long i = 0;
+      for (; i < static_cast<long>(new_num_clusters)-1; ++i) {
+        ++file_cluster_it;
+      }
+      for (; i<static_cast<long>(old_num_clusters)-1; ++i) {
+        cluster_idx_t old_cluster_idx  = *file_cluster_it;
+        ++file_cluster_it;
+        FAT.free(old_cluster_idx);
+      }
+    }
+    dir_ent.size = size;
+    directory::replace_directory_entry(dir_ent_itr, dir_ent);
+
     return 0;
-  } else {
-    return -ENOENT;
+  } catch (const filesystem_error& e) {
+    cerr << term_red << "write failed, returning error code " << e.errno_error_code() << term_reset << endl;
+    return e.errno_error_code();
   }
 }
 
 static int adam_utimens(const char *path, const struct timespec ts[2])
 {
-  fprintf(stderr, "ADAM: adam_utimens not implemented\n");
+  cerr << term_yellow << "utimens not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
@@ -758,7 +832,7 @@ static int adam_create(const char *cpath, mode_t mode, struct fuse_file_info *fi
 
 static int adam_open(const char *cpath, struct fuse_file_info *fi)
 {
-  string path(cpath);
+  const string path(cpath);
   cout<<term_yellow << "ADAM: adam_open called on ``" << path << "''" << term_reset<<endl;
 
   try {
@@ -768,44 +842,71 @@ static int adam_open(const char *cpath, struct fuse_file_info *fi)
 
     return 0;
   } catch (const filesystem_error& e) {
+    cerr << term_red << "open failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
 }
 
-static int adam_read(const char *cpath, char *buf, size_t size, off_t offset,
-                    struct fuse_file_info *fi)
+static int adam_read(const char *cpath, char *out_buf, size_t desired_size,
+                     off_t signed_offset, struct fuse_file_info *fi)
 {
 
-  string path(cpath);
-  if (path == "/adam") {
-    auto offset_contents = adam_file_contents.begin();
-    for(off_t i=0; i<offset && offset_contents != adam_file_contents.end();
-        ++i, ++offset_contents);
+  const string path(cpath);
+  const filesize_t offset = signed_offset;
+  cout<<term_yellow << "ADAM: adam_read called on ``" << path << "''" << term_reset<<endl;
+  char* ptr_to_unwritten_data = out_buf;
 
-    size_t rest_of_length = std::distance(offset_contents,
-                                          adam_file_contents.end());
-    size_t num_to_return = std::min(size, rest_of_length);
+  filesize_t remaining_bytes_to_read;
+  filesize_t num_bytes_to_read;
+  try {
+    directory_entry dir_ent = *get_directory_entry_iter_from_path(path);
 
-    std::copy_n(offset_contents, num_to_return, buf);
+    num_bytes_to_read = std::min<filesize_t>(desired_size, dir_ent.size - offset);
+    remaining_bytes_to_read = num_bytes_to_read;
+    if (num_bytes_to_read == 0) {
+      return 0;
+    }
 
-    return num_to_return;
-  } else {
-    return -ENOENT;
+    FAT_t::iterator file_cluster_it(dir_ent.starting_cluster);
+    // Skip to the offset
+    for (filesize_t i=0; i < offset / cluster_size; ++i, ++file_cluster_it);
+
+    // Start copying the bytes out
+    // First do the first partial cluster
+    if (offset % cluster_size != 0) {
+      filesize_t num_bytes_to_read_here = std::min(remaining_bytes_to_read,
+                                cluster_size - (offset  % cluster_size));
+
+      std::array<char, cluster_size> buf;
+      read_cluster(*file_cluster_it, buf.data());
+      std::copy_n(buf.begin(), num_bytes_to_read_here, ptr_to_unwritten_data);
+      ++file_cluster_it;
+
+      remaining_bytes_to_read -= num_bytes_to_read_here;
+      ptr_to_unwritten_data += num_bytes_to_read_here;
+    }
+
+    while (remaining_bytes_to_read >= cluster_size) {
+      read_cluster(*file_cluster_it, ptr_to_unwritten_data);
+
+      ptr_to_unwritten_data += cluster_size;
+      remaining_bytes_to_read -= cluster_size;
+      ++file_cluster_it;
+    }
+
+    if (remaining_bytes_to_read > 0) {
+      std::array<char, cluster_size> buf;
+      read_cluster(*file_cluster_it, buf.data());
+      std::copy_n(buf.begin(), remaining_bytes_to_read, ptr_to_unwritten_data);
+    }
+
+    return num_bytes_to_read;
+  } catch (end_of_file_exception_t) {
+    return num_bytes_to_read - remaining_bytes_to_read;
+  } catch(const filesystem_error& e) {
+    cerr << term_red << "write failed, returning error code " << e.errno_error_code() << term_reset << endl;
+    return e.errno_error_code();
   }
-        int fd;
-        int res;
-
-        (void) fi;
-        fd = open(cpath, O_RDONLY);
-        if (fd == -1)
-                return -errno;
-
-        res = pread(fd, buf, size, offset);
-        if (res == -1)
-                res = -errno;
-
-        close(fd);
-        return res;
 }
 
 static int adam_write(const char *cpath, const char *data_to_write, size_t big_size,
@@ -814,11 +915,9 @@ static int adam_write(const char *cpath, const char *data_to_write, size_t big_s
   const string path(cpath);
   const filesize_t offset = signed_offset;
   const filesize_t size = big_size;
+  cout<<term_yellow << "ADAM: adam_write called on ``" << path << "'' with offset " << offset << term_reset<<endl;
   try {
     directory::iterator dir_ent_itr = get_directory_entry_iter_from_path(path);
-    const filesize_t old_file_size = dir_ent_itr->size;
-    const filesize_t new_file_size = std::max(old_file_size, size+offset);
-    dir_ent_itr->size = new_file_size;
 
     // Iterate to the cluster for the correct offset
     // If we run out of clusters, start adding 0'd out clusters
@@ -827,7 +926,15 @@ static int adam_write(const char *cpath, const char *data_to_write, size_t big_s
       file_cluster_it = FAT_t::iterator(create_zeroed_end_cluster());
       dir_ent_itr->starting_cluster = *file_cluster_it;
     }
-      
+
+    // Now that the starting cluster is set if necessary, write the new size
+    const filesize_t old_file_size = dir_ent_itr->size;
+    const filesize_t new_file_size = std::max(old_file_size, size+offset);
+    if (old_file_size != new_file_size) {
+      dir_ent_itr->size = new_file_size;
+      dir_ent_itr.persist();
+    }
+
     for (filesize_t i=0; i < offset / cluster_size; ++i) {
       FAT_t::iterator last_file_cluster_it = file_cluster_it;
 
@@ -861,7 +968,8 @@ static int adam_write(const char *cpath, const char *data_to_write, size_t big_s
 
         std::array<char, cluster_size> buf;
         read_cluster(*file_cluster_it, buf.data());
-        std::copy_n(ptr_to_unwritten_data, num_bytes_to_write, buf.begin());
+        std::copy_n(ptr_to_unwritten_data, num_bytes_to_write,
+                    buf.begin() + cur_offset % cluster_size);
         write_cluster(*file_cluster_it, buf.data());
 
         remaining_size -= num_bytes_to_write;
@@ -876,54 +984,29 @@ static int adam_write(const char *cpath, const char *data_to_write, size_t big_s
 
     }
 
-    return 0;
+    return size;
   } catch (const filesystem_error& e) {
+    cerr << term_red << "write failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
-  //if (path == "/adam") {
-  //  const size_t new_file_size =
-  //    std::max(adam_file_contents.length(), size+offset);
-  //  adam_file_contents.resize(new_file_size);
-  //  auto offset_file_contents_it =
-  //    std::next(adam_file_contents.begin(), offset);
-  //  std::copy_n(buf, size, offset_file_contents_it);
-  //  return size;
-  //} else {
-  //  return -1;
-  //}
-
-  //      int fd;
-  //      int res;
-
-  //      (void) fi;
-  //      fd = open(cpath, O_WRONLY);
-  //      if (fd == -1)
-  //              return -errno;
-
-  //      res = pwrite(fd, buf, size, offset);
-  //      if (res == -1)
-  //              res = -errno;
-
-  //      close(fd);
-  //      return res;
 }
 
 static int adam_statfs(const char *path, struct statvfs *stbuf)
 {
-  fprintf(stderr, "ADAM: adam_statfs not implemented\n");
+  cerr << term_yellow << "statfs not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
 static int adam_release(const char *path, struct fuse_file_info *fi)
 {
-  fprintf(stderr, "ADAM: adam_release not implemented\n");
-  return -ENOSYS;
+  cerr << term_yellow << "release called on " << path << term_reset << endl;
+  return 0;
 }
 
 static int adam_fsync(const char *path, int isdatasync,
                      struct fuse_file_info *fi)
 {
-  fprintf(stderr, "ADAM: adam_fsync not implemented\n");
+  cerr << term_yellow << "fsync not implemented" << term_reset << endl;
   return -ENOSYS;
 }
 
