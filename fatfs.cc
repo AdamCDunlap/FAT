@@ -1164,13 +1164,14 @@ int main(int argc, char *argv[])
   static_assert(cluster_size > directory_entry_size+512,
       "directory entry too big to store root directory entry in superblock");
 
-  if (argc <= 1) {
-    cerr << "First argument should be name of backing file" << endl;
-    return 2;
-  }
-  string filestorename(argv[1]);
-  --argc;
-  ++argv;
+  //if (argc <= 1) {
+  //  cerr << "First argument should be name of backing file" << endl;
+  //  return 2;
+  //}
+  //string filestorename(argv[1]);
+  //--argc;
+  //++argv;
+  string filestorename("fstore");
   
   cout << "Opening " << filestorename << " as FAT backend." << endl;
   filestore.open(filestorename,
