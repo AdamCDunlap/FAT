@@ -1,7 +1,8 @@
 /*
  * C++ Version of Adam Dunlap's FAT filesystem
  *
- * Block size = cluster size
+ * Everything is implemented. There are a few bugs: sometimes read makes a file
+ * disappear but reappear when the filesystem is remounted
 */
 
 #define FUSE_USE_VERSION 26
@@ -61,9 +62,9 @@ static const string term_reset = "[0;0m";
 template<typename T>
 void write_cluster(size_t cluster_num, const T* data) {
   //cout << "Writing to cluster " << cluster_num << endl;
-  if (cluster_num == superblock_cluster) {
-    cout << term_red << "WARNING: Writing to superblock cluster!" << term_reset << endl;
-  }
+  //if (cluster_num == superblock_cluster) {
+  //  cout << term_red << "WARNING: Writing to superblock cluster!" << term_reset << endl;
+  //}
 
   filestore.seekp(cluster_num * cluster_size);
   filestore.write(reinterpret_cast<const char*>(data), cluster_size);
@@ -110,10 +111,10 @@ struct name_too_long_error_t : filesystem_error {
 struct end_of_file_exception_t {} end_of_file_exception;
 
 class FAT_t {
-  std::vector<cluster_idx_t> FAT_vec;
+  std::array<cluster_idx_t, padded_fat_entries> FAT_;
  public:
 
-  FAT_t() : FAT_vec(padded_fat_entries)
+  FAT_t()
   {
   }
 
@@ -125,7 +126,7 @@ class FAT_t {
       cerr << "ERROR: Making loop in FAT" << endl;
       exit(3);
     }
-    FAT_vec[idx-data_start_block] = val;
+    FAT_[idx-data_start_block] = val;
   }
 
   // Sets a value in the FAT and persists the change to disk
@@ -134,12 +135,12 @@ class FAT_t {
 
     const size_t cluster_idx = idx / cluster_size;
     write_cluster(fat_cluster + cluster_idx,
-                  FAT_vec.data() + cluster_idx*fat_entires_per_cluster);
+                  FAT_.data() + cluster_idx*fat_entires_per_cluster);
   }
 
-  void free(size_t idx) {
-    set(idx, 0);
-  }
+  void free(size_t idx);
+
+  void free_chain(size_t start_idx);
 
   void set_end(size_t idx) {
     set(idx, end_of_file_cluster_marker);
@@ -147,19 +148,21 @@ class FAT_t {
 
   // Gets a value from the in-memory FAT
   cluster_idx_t get(size_t idx) {
-    return FAT_vec[idx-data_start_block];
+    return FAT_[idx-data_start_block];
   }
 
   // Loads the FAT from the filestore file
   void load() {
     for (size_t i=0; i < fat_clusters; ++i) {
-      read_cluster(fat_cluster+i, FAT_vec.data() + i*fat_entires_per_cluster);
+      read_cluster(fat_cluster+i, FAT_.data() + i*fat_entires_per_cluster);
     }
   }
 
-  // Resets the FAT to all 0's
+  // Resets the FAT to all free
   void reset() {
-    std::fill(FAT_vec.begin(), FAT_vec.end(), 0);
+    // Make each entry point to the one after it
+    std::iota(FAT_.begin(), FAT_.begin() + fat_entries, data_start_block+1);
+    FAT_[fat_entries-1] = end_of_file_cluster_marker;
     persist();
   }
 
@@ -167,10 +170,16 @@ class FAT_t {
   void persist() {
     for(size_t cluster_idx=0; cluster_idx<fat_clusters; ++cluster_idx) {
       write_cluster(fat_cluster + cluster_idx,
-                    FAT_vec.data() + cluster_idx*fat_entires_per_cluster);
+                    FAT_.data() + cluster_idx*fat_entires_per_cluster);
     }
   }
 
+  size_t get_num_files() {
+    // Every file has an end of file marker, so count those. There's 1 extra
+    // because there's one for the end of the free space linked list.
+    return std::count(FAT_.begin(), FAT_.begin() + fat_entries,
+                      end_of_file_cluster_marker);
+  }
 
   class iterator
     : public std::iterator<std::forward_iterator_tag, cluster_idx_t>
@@ -208,19 +217,7 @@ FAT_t::iterator& FAT_t::iterator::operator++() {
   return *this;
 }
 
-// Returns the cluster number of a free cluster. Throws disk_full_error if
-// there are no free clusters.
-static cluster_idx_t get_free_cluster() {
-  // TODO: Use linked list. Change fill to iota in reset()
-  for (size_t i=data_start_block; i<fat_entries+data_start_block; ++i) {
-    if (FAT.get(i) == 0) {
-      return i;
-    }
-  }
-  //cerr << "Can't find any free clusters!" << endl;
-  throw disk_full_error;
-  return end_of_file_cluster_marker;
-}
+static cluster_idx_t get_free_cluster();
 
 cluster_idx_t create_zeroed_end_cluster() {
   cluster_idx_t new_cluster = get_free_cluster();
@@ -235,10 +232,11 @@ struct directory_entry {
   cluster_idx_t starting_cluster{end_of_file_cluster_marker};
   struct flags {
     //unsigned char filetype : 1;
-    enum { FILE, DIRECTORY } filetype;
+    enum : char { FILE, DIRECTORY, SYMLINK } filetype;
   } flags;
   static const size_t max_name_len = directory_entry_size - sizeof(size)
     - sizeof(starting_cluster) - sizeof(flags) - 1;
+
   std::array<char, max_name_len+1> name{{'\0'}};
 
   bool is_valid() const {
@@ -257,12 +255,48 @@ struct directory_entry {
 };
 
 struct superblock_t {
-  // other stuff I guess?
+  cluster_idx_t first_free_cluster;
+
   static const size_t superblock_pad_amt
-    = cluster_size - sizeof(directory_entry);
+    = cluster_size - sizeof(directory_entry) - sizeof(first_free_cluster);
   std::array<char, superblock_pad_amt> padding = {{0}};
   directory_entry root_directory_entry;
 } superblock;
+
+void FAT_t::free(size_t idx) {
+  set(idx, superblock.first_free_cluster);
+  superblock.first_free_cluster = idx;
+  write_cluster(superblock_cluster, &superblock);
+}
+
+void FAT_t::free_chain(size_t start_idx) {
+  // We'll just splice the lists together: make the last element of the given
+  // list point to the old first free cluster and make the new first free
+  // cluster point to start_idx
+  iterator it(start_idx);
+  // If it==end(), there's nothing to free
+  if (it != end()) {
+    while(it != end() && std::next(it) != end()) {
+      ++it;
+    }
+    set(*it, superblock.first_free_cluster);
+    superblock.first_free_cluster = start_idx;
+    write_cluster(superblock_cluster, &superblock);
+  }
+}
+
+// Returns the cluster number of a free cluster. Throws disk_full_error if
+// there are no free clusters.
+static cluster_idx_t get_free_cluster() {
+
+  cluster_idx_t next_free_cluster = superblock.first_free_cluster;
+  if (next_free_cluster == end_of_file_cluster_marker) {
+    throw disk_full_error;
+  }
+  superblock.first_free_cluster = FAT.get(next_free_cluster);
+  write_cluster(superblock_cluster, &superblock);
+  return next_free_cluster;
+}
 
 static void populate_dirent_with_dir(const string& name, directory_entry& d) {
   d.starting_cluster = get_free_cluster();
@@ -416,16 +450,16 @@ class directory {
   }
 
   // Finds an empty space in the directory and puts the directory_entry there
-  void add_directory_entry(const directory_entry& d) {
+  iterator add_directory_entry(const directory_entry& d) {
     iterator prev_it(424242); // Invalid so we can check for the magic number
 
     // This loop will always run at least once to prev_it will be set
     for (iterator it = raw_begin(); it != end(); it.move_to_next_entry()) {
       if (!it->is_valid()) {
-        //it.reread();
+        it.reread();
         *it = d;
         it.persist();
-        return;
+        return it;
       }
       prev_it = it;
     }
@@ -440,13 +474,14 @@ class directory {
     FAT.set_end(new_cluster);
     clear_cluster(new_cluster);
 
-    //cout << "add_directory_entry: moving to next entry" << endl;
     // Now that there's another cluster, prev_it will move to its first entry
     prev_it.move_to_next_entry();
+
     *prev_it = d;
-    //cout << "add_directory_entry: Persisting the iterator" << endl;
+
     prev_it.persist();
-    //cout << "add_directory_entry: Done" << endl;
+
+    return prev_it;
   }
 
   // XXX: Doesn't delete clusters if the directory can fit in fewer
@@ -457,7 +492,7 @@ class directory {
   }
 
   static void replace_directory_entry(iterator location, const directory_entry& d) {
-    //location.reread();
+    location.reread();
     *location = d;
     location.persist();
   }
@@ -477,8 +512,9 @@ directory_entry construct_dir_dir_ent(const string& name) {
   new_dir_ent.flags.filetype = directory_entry::flags::DIRECTORY;
   new_dir_ent.size = directory_size;
 
-  strncpy(new_dir_ent.name.data(), name.c_str(), new_dir_ent.name.size()-1);
-  new_dir_ent.name[new_dir_ent.name.size()-1] = '\0';
+  new_dir_ent.set_name(name);
+  //strncpy(new_dir_ent.name.data(), name.c_str(), new_dir_ent.name.size()-1);
+  //new_dir_ent.name[new_dir_ent.name.size()-1] = '\0';
 
   clear_cluster(new_dir_ent.starting_cluster);
   return new_dir_ent;
@@ -538,26 +574,91 @@ directory::iterator get_directory_entry_iter_from_path(const string& path) {
   }
 
   directory parent_directory(*parent_directory_entry_it);
-  directory::iterator it = parent_directory.begin();
 
-  cout << "Before loop" << endl;
-  while(it != parent_directory.end()) {
+  for (directory::iterator it = parent_directory.begin();
+      it != parent_directory.end(); ++it) {
     if (child_name == it->name.data()) {
       return it;
     }
-    cout << "Before increment" << endl;
-    ++it;
-    cout << "After increment" << endl;
   }
-  cout << "After loop" << endl;
-
-  ///for (directory::iterator it = parent_directory.begin();
-  ///    it != parent_directory.end(); ++it) {
-  ///  if (child_name == it->name.data()) {
-  ///    return it;
-  ///  }
-  //}
   throw nonexistant_file_error;
+}
+
+// Returns amount written
+static int write_data(directory::iterator dir_ent_itr, const char* data_to_write,
+    filesize_t size, filesize_t offset) {
+  // Iterate to the cluster for the correct offset
+  // If we run out of clusters, start adding 0'd out clusters
+  FAT_t::iterator file_cluster_it(dir_ent_itr->starting_cluster);
+  if (file_cluster_it == FAT.end()) {
+    file_cluster_it = FAT_t::iterator(create_zeroed_end_cluster());
+    dir_ent_itr.reread();
+    dir_ent_itr->starting_cluster = *file_cluster_it;
+    dir_ent_itr.persist();
+  }
+
+  // Now that the starting cluster is set if necessary, write the new size
+  const filesize_t old_file_size = dir_ent_itr->size;
+  const filesize_t new_file_size = std::max(old_file_size, size+offset);
+  if (old_file_size != new_file_size) {
+    dir_ent_itr.reread();
+    dir_ent_itr->size = new_file_size;
+    dir_ent_itr.persist();
+  }
+
+  for (filesize_t i=0; i < offset / cluster_size; ++i) {
+    FAT_t::iterator last_file_cluster_it = file_cluster_it;
+
+    ++file_cluster_it;
+
+    if (file_cluster_it == FAT.end()) {
+      file_cluster_it = FAT_t::iterator(create_zeroed_end_cluster());
+      FAT.set(*last_file_cluster_it, *file_cluster_it);
+    }
+  }
+
+  // file_cluster_it is now pointing at the start of the first cluster we
+  // want to write to, and the cluster is guaranteed to exist.
+
+  filesize_t cur_offset = offset; // Current absolute file offset in bytes
+  filesize_t remaining_size = size;
+  const char* ptr_to_unwritten_data = data_to_write;
+  while (remaining_size > 0) {
+    // The read-modify-write case. Necessary when:
+    //  * We're starting halfway through a cluster
+    //  * We're ending halfway through a cluster AND we're not writing to the
+    //      end of the file
+    if (cur_offset % cluster_size != 0
+        || (remaining_size < cluster_size
+            && offset+size > old_file_size)) {
+
+      // cur_offset % cluster_size is how far into this cluster we are
+      // Can't write more than the size of a cluster minus this
+      const filesize_t num_bytes_to_write = std::min(remaining_size,
+          cluster_size - (cur_offset % cluster_size));
+
+      std::array<char, cluster_size> buf;
+      read_cluster(*file_cluster_it, buf.data());
+      std::copy_n(ptr_to_unwritten_data, num_bytes_to_write,
+                  buf.begin() + cur_offset % cluster_size);
+      write_cluster(*file_cluster_it, buf.data());
+
+      remaining_size -= num_bytes_to_write;
+      ptr_to_unwritten_data += num_bytes_to_write;
+      cur_offset += num_bytes_to_write;
+    } else {
+      write_cluster(*file_cluster_it, ptr_to_unwritten_data);
+      if (remaining_size < cluster_size) {
+        break;
+      }
+      remaining_size -= cluster_size;
+      ptr_to_unwritten_data += cluster_size;
+      cur_offset += cluster_size;
+    }
+
+  }
+
+  return size;
 }
 
 static int adam_getattr(const char *cpath, struct stat *stbuf)
@@ -571,25 +672,25 @@ static int adam_getattr(const char *cpath, struct stat *stbuf)
   try {
     directory_entry dir_ent = *get_directory_entry_iter_from_path(path);
 
-    if (dir_ent.flags.filetype) {
-      stbuf->st_mode = S_IFDIR | 0755;
-      stbuf->st_nlink = 2;
-    } else {
-      stbuf->st_mode = S_IFREG | 0644;
-      stbuf->st_nlink = 1;
+    switch(dir_ent.flags.filetype) {
+      case directory_entry::flags::DIRECTORY:
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        break;
+      case directory_entry::flags::FILE:
+        stbuf->st_mode = S_IFREG | 0644;
+        stbuf->st_nlink = 1;
+        break;
+      case directory_entry::flags::SYMLINK:
+        stbuf->st_mode = S_IFLNK | 0755;
+        stbuf->st_nlink = 1;
+        break;
     }
 
     stbuf->st_size = dir_ent.size;
 
-    //stbuf->st_uid = getuid();
-    //stbuf->st_gid = getgid();
-    //stbuf->st_rdev = 0;
-
-    //stbuf->st_blocks = 3;
-    //struct timespec time0 = {1455428262, 0};
-    //stbuf->st_atim = time0;
-    //stbuf->st_mtim = time0;
-    //stbuf->st_ctim = time0;
+    stbuf->st_uid = getuid();
+    stbuf->st_gid = getgid();
 
     return 0;
 
@@ -617,13 +718,6 @@ static int adam_access(const char *cpath, int mask)
     return e.errno_error_code();
   }
 }
-
-static int adam_readlink(const char *path, char *buf, size_t size)
-{
-  cerr << term_yellow << "readlink not implemented" << term_reset << endl;
-  return -ENOSYS;
-}
-
 
 static int adam_readdir(const char *cpath, void *buf, fuse_fill_dir_t filler,
                        off_t signed_offset, struct fuse_file_info *fi)
@@ -731,22 +825,67 @@ static int adam_mkdir(const char *cpath, mode_t mode)
   }
 }
 
-static int adam_unlink(const char *path)
+static int adam_unlink(const char *cpath)
 {
-  cerr << term_yellow << "unlink not implemented" << term_reset << endl;
-  return -ENOSYS;
+  const string path(cpath);
+  cerr << term_yellow << "unlink called on " << path << term_reset << endl;
+
+  try {
+    directory::iterator dir_ent_itr = get_directory_entry_iter_from_path(path);
+
+    FAT.free_chain(dir_ent_itr->starting_cluster);
+    directory::delete_directory_entry(dir_ent_itr);
+
+    return 0;
+  } catch (const filesystem_error& e) {
+    cerr << term_red << "unlink failed, returning error code " << e.errno_error_code() << term_reset << endl;
+    return e.errno_error_code();
+  }
 }
 
-static int adam_rmdir(const char *path)
+static int adam_rmdir(const char *cpath)
 {
-  cerr << term_yellow << "rmdir not implemented" << term_reset << endl;
-  return -ENOSYS;
+  const string path(cpath);
+  cerr << term_yellow << "rmdir called on " << path << term_reset << endl;
+  try {
+    // Make sure the directory is empty
+    directory::iterator dir_ent_itr = get_directory_entry_iter_from_path(path);
+    directory dir(*dir_ent_itr);
+    if (dir.begin() != dir.end()) {
+      return -ENOTEMPTY;
+    }
+    FAT.free_chain(dir_ent_itr->starting_cluster);
+    directory::delete_directory_entry(dir_ent_itr);
+
+    return 0;
+  } catch (const filesystem_error& e) {
+    cerr << term_red << "unlink failed, returning error code " << e.errno_error_code() << term_reset << endl;
+    return e.errno_error_code();
+  }
 }
 
-static int adam_symlink(const char *to, const char *from)
+static int adam_symlink(const char *cto, const char *cfrom)
 {
-  cerr << term_yellow << "symlink not implemented" << term_reset << endl;
-  return -ENOSYS;
+  const string to(cto), from(cfrom);
+  try {
+    string parent_path, child_name;
+    std::tie(parent_path, child_name) = break_off_last_path_entry(from);
+    directory_entry parent_dir_ent
+      = *get_directory_entry_iter_from_path(parent_path);
+    directory parent_dir(parent_dir_ent);
+
+    directory_entry new_dir_ent;
+    new_dir_ent.flags.filetype = directory_entry::flags::SYMLINK;
+    new_dir_ent.set_name(child_name);
+    directory::iterator itr_to_dir_ent = parent_dir.add_directory_entry(new_dir_ent);
+
+    write_data(itr_to_dir_ent, to.c_str(), to.length(), 0);
+    return 0;
+  } catch (const filesystem_error& e) {
+    cerr << term_red << "symlink failed, returning error code " << e.errno_error_code() << term_reset << endl;
+    return e.errno_error_code();
+  }
+
 }
 
 static int adam_rename(const char *from, const char *to)
@@ -900,8 +1039,10 @@ static int adam_read(const char *cpath, char *out_buf, size_t desired_size,
       std::copy_n(buf.begin(), remaining_bytes_to_read, ptr_to_unwritten_data);
     }
 
+    cout<<term_yellow << "ADAM: adam_read returning " << num_bytes_to_read << term_reset<<endl;
     return num_bytes_to_read;
   } catch (end_of_file_exception_t) {
+    cout<<term_yellow << "ADAM: adam_read returning early after reading " << num_bytes_to_read - remaining_bytes_to_read << term_reset<<endl;
     return num_bytes_to_read - remaining_bytes_to_read;
   } catch(const filesystem_error& e) {
     cerr << term_red << "write failed, returning error code " << e.errno_error_code() << term_reset << endl;
@@ -909,92 +1050,94 @@ static int adam_read(const char *cpath, char *out_buf, size_t desired_size,
   }
 }
 
-static int adam_write(const char *cpath, const char *data_to_write, size_t big_size,
-                     off_t signed_offset, struct fuse_file_info *fi)
+static int adam_write(const char *cpath, const char *data_to_write, size_t size,
+                     off_t offset, struct fuse_file_info *fi)
 {
   const string path(cpath);
-  const filesize_t offset = signed_offset;
-  const filesize_t size = big_size;
   cout<<term_yellow << "ADAM: adam_write called on ``" << path << "'' with offset " << offset << term_reset<<endl;
   try {
     directory::iterator dir_ent_itr = get_directory_entry_iter_from_path(path);
-
-    // Iterate to the cluster for the correct offset
-    // If we run out of clusters, start adding 0'd out clusters
-    FAT_t::iterator file_cluster_it(dir_ent_itr->starting_cluster);
-    if (file_cluster_it == FAT.end()) {
-      file_cluster_it = FAT_t::iterator(create_zeroed_end_cluster());
-      dir_ent_itr->starting_cluster = *file_cluster_it;
-    }
-
-    // Now that the starting cluster is set if necessary, write the new size
-    const filesize_t old_file_size = dir_ent_itr->size;
-    const filesize_t new_file_size = std::max(old_file_size, size+offset);
-    if (old_file_size != new_file_size) {
-      dir_ent_itr->size = new_file_size;
-      dir_ent_itr.persist();
-    }
-
-    for (filesize_t i=0; i < offset / cluster_size; ++i) {
-      FAT_t::iterator last_file_cluster_it = file_cluster_it;
-
-      ++file_cluster_it;
-
-      if (file_cluster_it == FAT.end()) {
-        file_cluster_it = FAT_t::iterator(create_zeroed_end_cluster());
-        FAT.set(*last_file_cluster_it, *file_cluster_it);
-      }
-    }
-
-    // file_cluster_it is now pointing at the start of the first cluster we
-    // want to write to, and the cluster is guaranteed to exist.
-
-    filesize_t cur_offset = offset; // Current absolute file offset in bytes
-    filesize_t remaining_size = size;
-    const char* ptr_to_unwritten_data = data_to_write;
-    while (remaining_size > 0) {
-      // The read-modify-write case. Necessary when:
-      //  * We're starting halfway through a cluster
-      //  * We're ending halfway through a cluster AND we're not writing to the
-      //      end of the file
-      if (cur_offset % cluster_size != 0
-          || (remaining_size < cluster_size
-              && offset+size > old_file_size)) {
-
-        // cur_offset % cluster_size is how far into this cluster we are
-        // Can't write more than the size of a cluster minus this
-        filesize_t num_bytes_to_write = std::min(remaining_size,
-            cluster_size - (cur_offset % cluster_size));
-
-        std::array<char, cluster_size> buf;
-        read_cluster(*file_cluster_it, buf.data());
-        std::copy_n(ptr_to_unwritten_data, num_bytes_to_write,
-                    buf.begin() + cur_offset % cluster_size);
-        write_cluster(*file_cluster_it, buf.data());
-
-        remaining_size -= num_bytes_to_write;
-        ptr_to_unwritten_data += num_bytes_to_write;
-        cur_offset += num_bytes_to_write;
-      } else {
-        write_cluster(*file_cluster_it, ptr_to_unwritten_data);
-        remaining_size -= cluster_size;
-        ptr_to_unwritten_data += cluster_size;
-        cur_offset += cluster_size;
-      }
-
-    }
-
-    return size;
+    return write_data(dir_ent_itr, data_to_write, size, offset);
   } catch (const filesystem_error& e) {
     cerr << term_red << "write failed, returning error code " << e.errno_error_code() << term_reset << endl;
     return e.errno_error_code();
   }
 }
 
+static int adam_readlink(const char *cpath, char *buf, size_t size)
+{
+  cerr << term_yellow << "readlink called" << term_reset << endl;
+  int bytes_written = adam_read(cpath, buf, size, 0, nullptr);
+  if (bytes_written < 0) {
+    // Error, pass it on
+    return bytes_written;
+  }
+  // We need to null-terminate the string. So if the link filled up the whole
+  // buffer, replace the last byte with 0; otherwise just add a 0 to the end
+  if (static_cast<size_t>(bytes_written) == size) {
+    --bytes_written;
+  }
+  buf[bytes_written] = '\0';
+
+  return 0;
+
+  //const string path(cpath);
+  //try {
+  //  directory_entry dir_ent = *get_directory_entry_iter_from_path(path);
+  //  filesize_t remaining_bytes_to_read = dir_ent.size;
+
+  //  while (remaining_bytes_to_read >= cluster_size) {
+  //    
+  //  }
+
+  //} catch(const filesystem_error& e) {
+  //  cerr << term_red << "write failed, returning error code " << e.errno_error_code() << term_reset << endl;
+  //  return e.errno_error_code();
+  //}
+  //return -ENOSYS;
+}
+
+
 static int adam_statfs(const char *path, struct statvfs *stbuf)
 {
-  cerr << term_yellow << "statfs not implemented" << term_reset << endl;
-  return -ENOSYS;
+  cerr << term_yellow << "statfs called" << term_reset << endl;
+
+  // The free clusters are stored as if they're a file, so the number of
+  // clusters in that "file" is the number of free clusters
+  size_t num_free_clusters =
+    std::distance(FAT_t::iterator(superblock.first_free_cluster), FAT.end());
+
+  // 0 out unset entries
+  memset(stbuf, 0, sizeof(*stbuf));
+
+  // block size
+  stbuf->f_bsize = cluster_size;
+  // fragment size
+  stbuf->f_frsize = cluster_size;
+  // total number of blocks
+  stbuf->f_blocks = filestore_size / cluster_size;
+  // Number of free blocks
+  stbuf->f_bfree = num_free_clusters;
+  // Number of free blocks for unprivilege users
+  stbuf->f_bavail = num_free_clusters;
+
+  // Number of inodes
+  stbuf->f_files = FAT.get_num_files();
+  // Number of free inodes. You can do one file per cluster
+  stbuf->f_ffree = num_free_clusters;
+  // Number of free inodes for unprivileged users
+  stbuf->f_favail = num_free_clusters;
+
+  // filesystem ID
+  stbuf->f_fsid = 9098769876; // Copyright (c) Lisa Yin
+  // "flag"s
+  stbuf->f_flag = ST_NOATIME | ST_NODEV | ST_NODIRATIME | ST_SYNCHRONOUS;
+  // Maximum name length
+  stbuf->f_namemax = directory_entry::max_name_len;
+
+  cout << term_yellow << num_free_clusters << " clusters free (FAT entries: " << fat_entries <<  ", padded: " << padded_fat_entries << ")" << term_reset << endl;
+
+  return 0;
 }
 
 static int adam_release(const char *path, struct fuse_file_info *fi)
@@ -1039,6 +1182,8 @@ int main(int argc, char *argv[])
     filestore.open(filestorename, std::ios_base::out | std::ios_base::binary);
 
     FAT.reset();
+
+    superblock.first_free_cluster = data_start_block;
 
     populate_dirent_with_dir("/", superblock.root_directory_entry);
     write_cluster(superblock_cluster, &superblock);
